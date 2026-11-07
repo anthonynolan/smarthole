@@ -1,0 +1,55 @@
+[project]
+name = "smarthole"
+version = "0.1.0"
+description = "Custom hosted Anki reviewer with FSRS scheduling, APKG import, MongoDB Atlas storage"
+readme = "README.md"
+authors = [
+    { name = "Anthony Nolan", email = "anthonynolan@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115,<0.117",
+    "uvicorn[standard]>=0.32,<0.34",
+    "python-dotenv>=1.0.1,<2",
+    "mongoengine>=0.29.1,<0.30",
+    "pymongo>=4.9,<5",
+    "fsrs>=6.0,<7",
+    "python-multipart>=0.0.18",
+    "bleach>=6.1",
+    "email-validator>=2.0",
+    "google-auth>=2.40.2,<3",
+    "requests>=2.31,<3",
+    # Pinned below 25: newer wheels need glibc 2.36+ (this host is 2.31).
+    "anki>=24.11,<25",
+]
+
+[project.scripts]
+smarthole = "smarthole:main"
+
+[dependency-groups]
+test = [
+    "mongomock>=4.3.0",
+    "pytest>=8.3.3,<9",
+    "httpx>=0.27",
+]
+dev = [
+    "ruff>=0.4.5",
+]
+
+[build-system]
+requires = ["uv_build>=0.12.13,<0.13.0"]
+build-backend = "uv_build"
+
+[tool.ruff]
+line-length = 88
+target-version = "py312"
+fix = true
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "W", "C90"]
+ignore = ["E501", "B008", "C901"]
+
+[tool.ruff.lint.per-file-ignores]
+"src/smarthole/models.py" = ["RUF012"]
+# app.py calls load_dotenv() before importing routes on purpose.
+"src/smarthole/app.py" = ["E402"]

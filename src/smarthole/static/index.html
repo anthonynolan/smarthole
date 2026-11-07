@@ -1,0 +1,372 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>smarthole</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 640px; margin: 2rem auto; padding: 0 1rem; }
+  .card { border: 1px solid #ccc; border-radius: 8px; padding: 1.5rem; margin: 1rem 0; min-height: 120px; }
+  .row { display: flex; gap: .5rem; margin: .5rem 0; flex-wrap: wrap; }
+  button { padding: .5rem 1rem; font-size: 1rem; cursor: pointer; }
+  input, select { padding: .5rem; font-size: 1rem; }
+  .muted { color: #666; }
+  #back { border-top: 1px dashed #aaa; margin-top: 1rem; padding-top: 1rem; }
+  table { border-collapse: collapse; table-layout: fixed; width: 100%; margin-top: .5rem; }
+  th, td { border: 1px solid #ccc; padding: .4rem .6rem; text-align: left; vertical-align: top; }
+  th button { border: none; background: none; font: inherit; font-weight: bold; cursor: pointer; padding: 0; }
+  th.num, td.num { width: 2.5rem; text-align: right; }
+  th.date, td.date { width: 8.5rem; }
+  td.q { white-space: normal; overflow-wrap: break-word; }
+  tr.suspended td { color: #999; }
+</style>
+</head>
+<body>
+<h1>smarthole</h1>
+
+<section id="auth">
+  <h2>Sign in</h2>
+  <div class="row"><div id="google-btn"></div></div>
+  <div class="row">
+    <input id="email" type="email" placeholder="email" autocomplete="username">
+    <input id="password" type="password" placeholder="password" autocomplete="current-password">
+  </div>
+  <div class="row">
+    <button id="login">Log in</button>
+    <button id="register">Register</button>
+    <button id="logout">Log out</button>
+    <span id="who" class="muted"></span>
+  </div>
+</section>
+<script src="https://accounts.google.com/gsi/client" async defer></script>
+
+<section id="library">
+  <h2>Decks</h2>
+  <div class="row">
+    <input id="apkg" type="file" accept=".apkg,.colpkg">
+    <button id="import">Import .apkg</button>
+    <span id="import-status" class="muted"></span>
+  </div>
+  <div id="decks"></div>
+</section>
+
+<section id="browse">
+  <h2>Browse</h2>
+  <div class="row">
+    <select id="browse-deck"></select>
+    <button id="browse-load">Load cards</button>
+    <span id="browse-count" class="muted"></span>
+  </div>
+  <table id="cards-table" hidden>
+    <thead><tr>
+      <th class="num">#</th>
+      <th>Question</th>
+      <th class="date"><button id="sort-due">Due</button></th>
+      <th class="date"><button id="sort-seen">Last reviewed</button></th>
+    </tr></thead>
+    <tbody id="cards-body"></tbody>
+  </table>
+  <div id="more-sentinel" hidden></div>
+</section>
+
+<section id="review">
+  <h2>Review <span id="due-count" class="muted"></span></h2>
+  <div class="row">
+    <button id="next">Next due card</button>
+  </div>
+  <div id="study" hidden>
+    <div class="card"><div id="front"></div><div id="back" hidden></div></div>
+    <div class="row">
+      <button id="show">Show answer</button>
+    </div>
+    <div class="row" id="grades" hidden>
+      <button data-r="1">Again</button>
+      <button data-r="2">Hard</button>
+      <button data-r="3">Good</button>
+      <button data-r="4">Easy</button>
+    </div>
+    <p id="result" class="muted"></p>
+  </div>
+</section>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let current = null;
+let deckFilter = "";
+
+async function api(path, opts = {}) {
+  const res = await fetch(path, {
+    headers: {"Content-Type": "application/json"},
+    ...opts,
+  });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+async function refreshMe() {
+  try {
+    const me = await api("/api/me");
+    $("who").textContent = me.email;
+  } catch { $("who").textContent = "signed out"; }
+}
+
+async function refreshDecks() {
+  const {decks} = await api("/api/decks").catch(() => ({decks: []}));
+  const box = $("decks");
+  box.innerHTML = "";
+  const all = document.createElement("button");
+  all.textContent = "All decks";
+  all.onclick = () => { deckFilter = ""; loadNext(); };
+  box.appendChild(all);
+  for (const d of decks) {
+    const b = document.createElement("button");
+    b.textContent = `${d.name} — ${d.due} due, ${d.new} new`;
+    b.onclick = () => { deckFilter = d.id; loadNext(); };
+    box.appendChild(b);
+    box.appendChild(document.createTextNode(" "));
+  }
+  const due = decks.reduce((n, d) => n + d.due, 0);
+  const fresh = decks.reduce((n, d) => n + d.new, 0);
+  $("due-count").textContent = due ? `— ${due} due` : fresh ? `— 0 due, ${fresh} new waiting` : "— nothing due";
+  fillBrowseDecks(decks);
+}
+
+$("login").onclick = async () => {
+  await api("/api/login", {method: "POST", body: JSON.stringify({email: $("email").value, password: $("password").value})});
+  await refreshMe(); await refreshDecks();
+};
+$("register").onclick = async () => {
+  await api("/api/register", {method: "POST", body: JSON.stringify({email: $("email").value, password: $("password").value})});
+  await refreshMe(); await refreshDecks();
+};
+$("logout").onclick = async () => {
+  await fetch("/api/logout", {method: "POST"});
+  await refreshMe(); await refreshDecks();
+};
+$("import").onclick = async () => {
+  const f = $("apkg").files[0];
+  if (!f) {
+    $("import-status").textContent = "choose a .apkg or .colpkg file first";
+    return;
+  }
+  $("import-status").textContent = "uploading and importing… (large decks take a minute)";
+  const form = new FormData();
+  form.append("file", f);
+  try {
+    const res = await fetch("/api/import", {method: "POST", body: form});
+    if (!res.ok) {
+      $("import-status").textContent = "import failed: " + await res.text();
+    } else {
+      const data = await res.json();
+      let msg = `${data.imported} cards imported, ${data.due} due now`;
+      msg += data.scheduling
+        ? " (Anki schedule kept)"
+        : " (no scheduling in file — re-export with 'Include scheduling information' to keep due dates)";
+      $("import-status").textContent = msg;
+    }
+  } catch (e) {
+    $("import-status").textContent = "import failed: could not reach the server";
+  }
+  await refreshDecks();
+};
+
+async function loadNext() {
+  const q = deckFilter ? `?deck_id=${deckFilter}` : "";
+  const {cards} = await api("/api/next" + q);
+  if (!cards.length) {
+    $("study").hidden = true;
+    $("due-count").textContent = "— nothing due";
+    return;
+  }
+  current = cards[0];
+  $("study").hidden = false;
+  $("front").innerHTML = current.front_html;
+  $("back").innerHTML = "";
+  $("back").hidden = true;
+  $("grades").hidden = true;
+  $("show").hidden = false;
+  $("result").textContent = "";
+}
+
+$("next").onclick = loadNext;
+$("show").onclick = () => {
+  $("back").innerHTML = current.back_html;
+  $("back").hidden = false;
+  $("grades").hidden = false;
+  $("show").hidden = true;
+};
+document.querySelectorAll("#grades button").forEach((b) => {
+  b.onclick = async () => {
+    const updated = await api(`/api/review/${current.card_id}`, {
+      method: "POST",
+      body: JSON.stringify({rating: Number(b.dataset.r)}),
+    });
+    $("result").textContent = `Next due: ${updated.due}`;
+    await refreshDecks();
+    await loadNext();
+  };
+});
+
+async function googleCredential(res) {
+  await fetch("/api/google", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({token: res.credential}),
+  }).then((r) => {
+    if (!r.ok) throw new Error("google sign-in failed");
+    return r.json();
+  });
+  await refreshMe(); await refreshDecks();
+}
+
+async function initGoogle() {
+  const cfg = await api("/api/config").catch(() => ({}));
+  if (!cfg.googleClientId || typeof google === "undefined") return;
+  google.accounts.id.initialize({
+    client_id: cfg.googleClientId,
+    callback: googleCredential,
+  });
+  google.accounts.id.renderButton($("google-btn"), {theme: "outline", size: "large"});
+}
+
+let sortKey = "due";
+let sortDir = "asc";
+
+function fmtDate(iso) {
+  if (!iso) return "—";
+  return new Date(iso).toLocaleString(undefined, {
+    month: "numeric", day: "numeric", hour: "numeric", minute: "2-digit",
+  });
+}
+
+const BROWSE_PAGE = 20;
+let browseTotal = Infinity;
+let renderedCount = 0;
+let browseLoading = false;
+let scrollObserver = null;
+
+function makeRow(r, i) {
+  const tr = document.createElement("tr");
+  if (r.suspended) tr.className = "suspended";
+  const num = document.createElement("td");
+  num.className = "num";
+  num.textContent = String(i + 1);
+  const q = document.createElement("td");
+  q.className = "q";
+  q.textContent = r.front_text + (r.suspended ? " (suspended)" : "");
+  const due = document.createElement("td");
+  due.className = "date";
+  due.textContent = fmtDate(r.due);
+  const seen = document.createElement("td");
+  seen.className = "date";
+  seen.textContent = fmtDate(r.last_review);
+  tr.append(num, q, due, seen);
+  return tr;
+}
+
+function updateBrowseCount() {
+  const total = browseTotal === Infinity ? "…" : browseTotal;
+  $("browse-count").textContent = `showing ${renderedCount} of ${total} cards`;
+  $("more-sentinel").hidden = renderedCount >= browseTotal;
+}
+
+function updateSortArrows() {
+  $("sort-due").textContent =
+    "Due" + (sortKey === "due" ? (sortDir === "asc" ? " ▲" : " ▼") : "");
+  $("sort-seen").textContent =
+    "Last reviewed" + (sortKey === "last_review" ? (sortDir === "asc" ? " ▲" : " ▼") : "");
+}
+
+async function appendMore() {
+  const id = $("browse-deck").value;
+  if (!id || browseLoading || renderedCount >= browseTotal) return;
+  browseLoading = true;
+  try {
+    const {cards, total} = await api(
+      `/api/decks/${id}/cards?sort=${sortKey}&direction=${sortDir}&skip=${renderedCount}&limit=${BROWSE_PAGE}`
+    );
+    browseTotal = total;
+    const tb = $("cards-body");
+    const frag = document.createDocumentFragment();
+    cards.forEach((r, j) => frag.appendChild(makeRow(r, renderedCount + j)));
+    tb.appendChild(frag);
+    renderedCount += cards.length;
+    if (cards.length === 0) browseTotal = renderedCount;
+    $("cards-table").hidden = renderedCount === 0;
+    updateBrowseCount();
+  } finally {
+    browseLoading = false;
+  }
+}
+
+async function loadBrowse() {
+  const id = $("browse-deck").value;
+  if (!id) return;
+  $("cards-body").innerHTML = "";
+  renderedCount = 0;
+  browseTotal = Infinity;
+  browseLoading = false;
+  updateSortArrows();
+  await appendMore();
+  watchSentinel();
+}
+
+function watchSentinel() {
+  if (scrollObserver) scrollObserver.disconnect();
+  window.onscroll = null;
+  const sentinel = $("more-sentinel");
+  if (!("IntersectionObserver" in window)) {
+    window.onscroll = () => {
+      if (window.innerHeight + window.scrollY >= document.body.scrollHeight - 400) appendMore();
+    };
+    return;
+  }
+  scrollObserver = new IntersectionObserver((entries) => {
+    if (entries.some((e) => e.isIntersecting)) appendMore();
+  });
+  scrollObserver.observe(sentinel);
+}
+
+async function loadBrowse() {
+  const id = $("browse-deck").value;
+  if (!id) return;
+  const {cards} = await api(`/api/decks/${id}/cards`);
+  browseRows = cards;
+  sortKey = "due";
+  sortDir = 1;
+  renderBrowse();
+}
+
+$("browse-load").onclick = loadBrowse;
+$("browse-deck").onchange = loadBrowse;
+$("sort-due").onclick = () => {
+  if (sortKey === "due") sortDir = sortDir === "asc" ? "desc" : "asc";
+  else { sortKey = "due"; sortDir = "asc"; }
+  loadBrowse();
+};
+$("sort-seen").onclick = () => {
+  if (sortKey === "last_review") sortDir = sortDir === "asc" ? "desc" : "asc";
+  else { sortKey = "last_review"; sortDir = "desc"; }
+  loadBrowse();
+};
+
+function fillBrowseDecks(decks) {
+  const sel = $("browse-deck");
+  const prev = sel.value;
+  sel.innerHTML = "";
+  for (const d of decks) {
+    const o = document.createElement("option");
+    o.value = d.id;
+    o.textContent = d.name;
+    sel.appendChild(o);
+  }
+  if ([...sel.options].some((o) => o.value === prev)) sel.value = prev;
+}
+
+refreshMe();
+refreshDecks();
+if (document.readyState === "complete") initGoogle();
+else window.addEventListener("load", initGoogle);
+</script>
+</body>
+</html>

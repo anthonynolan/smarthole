@@ -1,0 +1,20 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Local secrets and personal data (never commit)
+.env
+*.apkg
+*.colpkg
+
+# Frontend build (rebuild with: cd smarthole-client && npm install && npm run build)
+smarthole-client/node_modules/
+smarthole-client/dist/
+.env.prod

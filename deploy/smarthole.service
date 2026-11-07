@@ -1,0 +1,16 @@
+[Unit]
+Description=Smarthole FastAPI Service
+After=network.target
+
+[Service]
+User=ec2-user
+WorkingDirectory=/home/ec2-user/smarthole
+ExecStart=/home/ec2-user/smarthole/scripts/prod_start_uvicorn.sh
+Environment="PATH=/home/ec2-user/.local/bin:/usr/local/bin:/usr/bin:/bin"
+EnvironmentFile=/home/ec2-user/smarthole/.env
+Restart=always
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
