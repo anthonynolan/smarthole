@@ -183,6 +183,11 @@ def test_review_flow(client, tmp_path):
     assert len(due) == 1
     card_id = due[0]["card_id"]
     assert "Q1" in due[0]["front_html"] and "A1" in due[0]["back_html"]
+    # The {{FrontSide}} echo in the answer template is stripped for review:
+    # the question must not be repeated before the answer.
+    assert "Q1" not in due[0]["back_html"]
+    # Grade-button previews: one next-due per rating.
+    assert set(due[0]["intervals"]) == {"1", "2", "3", "4"}
 
     graded = client.post(f"/api/review/{card_id}", json={"rating": 3}).json()
     assert graded["reps"] == 1
@@ -196,6 +201,69 @@ def test_review_flow(client, tmp_path):
 
     bad = client.post(f"/api/review/{card_id}", json={"rating": 9})
     assert bad.status_code == 400
+
+
+def test_next_exclude_skips_current_card(client, tmp_path):
+    """Preload support: the ungraded current card is still due, so skip it."""
+    register(client)
+    apkg = make_apkg(tmp_path)
+    with open(apkg, "rb") as f:
+        assert (
+            client.post(
+                "/api/import", files={"file": ("test.apkg", f, "application/zip")}
+            ).status_code
+            == 201
+        )
+    first = client.get("/api/next").json()["cards"][0]
+    assert "Q1" in first["front_html"]
+    skipped = client.get(f"/api/next?exclude={first['card_id']}").json()["cards"]
+    assert len(skipped) == 1 and "Q2" in skipped[0]["front_html"]
+
+
+def test_browse_search_filters_front_and_back(client, tmp_path):
+    """?q= searches card text across the whole deck in the database."""
+    register(client)
+    apkg = make_apkg(tmp_path)
+    with open(apkg, "rb") as f:
+        assert (
+            client.post(
+                "/api/import", files={"file": ("test.apkg", f, "application/zip")}
+            ).status_code
+            == 201
+        )
+    deck_id = client.get("/api/decks").json()["decks"][0]["id"]
+
+    def search(q):
+        return client.get(f"/api/decks/{deck_id}/cards?limit=100&q={q}").json()
+
+    assert search("Q1")["total"] == 1
+    assert search("Q1")["cards"][0]["front_text"] == "Q1"
+    assert search("a2")["total"] == 1  # case-insensitive back-side match
+    assert search("zzz") == {"cards": [], "total": 0}
+    assert search("")["total"] == 2
+
+
+def test_browse_due_today_flags(client, tmp_path):
+    """Browse rows say whether the card counts as due today."""
+    import time
+
+    register(client)
+    now_ms = int(time.time() * 1000)
+    apkg, _, _, _ = make_sched_apkg(tmp_path, now_ms)
+    with open(apkg, "rb") as f:
+        assert (
+            client.post(
+                "/api/import", files={"file": ("sched.apkg", f, "application/zip")}
+            ).status_code
+            == 201
+        )
+    deck_id = client.get("/api/decks").json()["decks"][0]["id"]
+    rows = client.get(f"/api/decks/{deck_id}/cards?limit=100").json()["cards"]
+    flags = {r["front_text"]: r["due_today"] for r in rows}
+    assert flags["LQ"] is True  # learning, due within the hour
+    assert flags["RQ"] is False  # review card due months out
+    assert flags["NQ"] is False  # unseen
+    assert flags["SQ"] is False  # suspended
 
 
 def test_google_login_creates_user_and_session(client, monkeypatch):
@@ -504,6 +572,21 @@ def test_apply_rating_with_naive_stored_datetimes():
     assert updated["last_review"].tzinfo is not None
 
 
+def test_strip_front_echo():
+    from smarthole.app import strip_front_echo
+
+    # Standard Anki answer template: question echoed, then <hr>, then answer.
+    assert strip_front_echo("Q", "Q<hr>A") == "A"
+    assert strip_front_echo("Q", "Q\n<hr id=answer>\nA") == "\nA"
+    # No echo: untouched.
+    assert strip_front_echo("Q", "A") == "A"
+    assert strip_front_echo("Q", "Q and more, no rule") == "Q and more, no rule"
+    # Answer merely starts with the same words but has no <hr>: untouched.
+    assert strip_front_echo("Paris", "Paris is the capital") == "Paris is the capital"
+    assert strip_front_echo("", "A") == "A"
+    assert strip_front_echo("Q", "") == ""
+
+
 def test_plain_text_strips_and_truncates():
     from smarthole.app import plain_text
 
@@ -757,3 +840,75 @@ def test_create_card_sanitizes_markup(client):
     assert "style" not in card.back_html.lower() or "<style" not in card.back_html
     assert "<i>there</i>" in card.back_html
     assert "onclick" not in card.back_html
+
+
+def _stream_lines(res):
+    lines = [json.loads(line) for line in res.text.splitlines() if line.strip()]
+    assert lines, "expected NDJSON progress lines"
+    return lines
+
+
+def test_import_stream_reports_progress(client, tmp_path):
+    register(client)
+    apkg = make_apkg(tmp_path)
+    with open(apkg, "rb") as f:
+        res = client.post(
+            "/api/import?stream=true",
+            files={"file": ("test.apkg", f, "application/zip")},
+        )
+    assert res.status_code == 200, res.text
+    assert "x-ndjson" in res.headers["content-type"]
+    lines = _stream_lines(res)
+    stages = [line.get("stage") for line in lines]
+    assert stages[0] == "upload"
+    assert "parse" in stages and "save" in stages
+    parse_final = [line for line in lines if line.get("stage") == "parse"][-1]
+    assert parse_final["done"] == parse_final["total"] == 2
+    save_final = [line for line in lines if line.get("stage") == "save"][-1]
+    assert save_final["done"] == save_final["total"] == 2
+    complete = [line for line in lines if line.get("complete")]
+    assert len(complete) == 1
+    assert complete[0]["result"]["imported"] == 2
+    assert not any("error" in line for line in lines)
+
+
+def test_import_stream_bad_package(client, tmp_path):
+    register(client)
+    bad = tmp_path / "bad.apkg"
+    bad.write_bytes(b"not a zip file")
+    with open(bad, "rb") as f:
+        res = client.post(
+            "/api/import?stream=true",
+            files={"file": ("bad.apkg", f, "application/zip")},
+        )
+    assert res.status_code == 200, res.text
+    lines = _stream_lines(res)
+    assert any("error" in line for line in lines)
+    assert not any(line.get("complete") for line in lines)
+
+
+def test_decks_reports_due_today(client, tmp_path):
+    from datetime import datetime, timedelta, timezone
+
+    from smarthole.models import CardState
+
+    register(client)
+    apkg = make_apkg(tmp_path)
+    with open(apkg, "rb") as f:
+        res = client.post(
+            "/api/import", files={"file": ("test.apkg", f, "application/zip")}
+        )
+    assert res.status_code == 201, res.text
+    now = datetime.now(timezone.utc)
+    states = list(CardState.objects())
+    assert len(states) == 2
+    states[0].update(set__reps=3, set__due=now - timedelta(hours=1))
+    later = now + timedelta(hours=2)
+    states[1].update(set__reps=2, set__due=later)
+    day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    expected_today = 2 if later < day_start + timedelta(days=1) else 1
+    decks = client.get("/api/decks").json()["decks"]
+    assert len(decks) == 1
+    assert decks[0]["due"] == 1
+    assert decks[0]["new"] == 0
+    assert decks[0]["due_today"] == expected_today

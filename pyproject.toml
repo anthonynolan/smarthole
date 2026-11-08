@@ -19,6 +19,9 @@ dependencies = [
     "email-validator>=2.0",
     "google-auth>=2.40.2,<3",
     "requests>=2.31,<3",
+    "mcp>=1.27.2,<2",
+    "python-jose>=3.4.0",
+    "openai>=1.99,<2",
     # Pinned below 25: newer wheels need glibc 2.36+ (this host is 2.31).
     "anki>=24.11,<25",
 ]

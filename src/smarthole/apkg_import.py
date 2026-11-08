@@ -27,6 +27,8 @@ import bleach
 SUSPENDED_QUEUE = -1
 BURIED_QUEUES = (-2, -3)
 MAX_CARDS = 200_000
+# Cards between progress events while parsing or saving.
+PROGRESS_EVERY = 25
 
 ALLOWED_TAGS = [
     "p",
@@ -109,14 +111,30 @@ def rewrite_media_refs(html: str, filename_to_url: dict[str, str]) -> str:
     return html
 
 
-def parse_apkg(path: str | Path) -> ImportResult:
+def parse_apkg(path: str | Path, on_progress=None) -> ImportResult:
+    """Parse a package, calling ``on_progress(stage, done, total)`` as cards
+    are read. ``stage`` is ``"parse"`` here; saving progress is reported by
+    the caller (see ``/api/import?stream=true``)."""
+    events = parse_apkg_events(path)
+    while True:
+        try:
+            stage, done, total = next(events)
+        except StopIteration as stop:
+            return stop.value
+        if on_progress is not None:
+            on_progress(stage, done, total)
+
+
+def parse_apkg_events(path: str | Path):
+    """Yield ``(stage, done, total)`` tuples while parsing; the generator's
+    return value is the finished :class:`ImportResult`."""
     path = Path(path)
     with zipfile.ZipFile(path) as zf:
         names = zf.namelist()
     if "meta" in names or any(n.endswith(".anki21b") for n in names):
-        result = _parse_with_anki(path)
+        result = yield from _parse_with_anki(path)
     else:
-        result = _parse_legacy(path, names)
+        result = yield from _parse_legacy(path, names)
     result.scheduling = any(
         c.anki_type != 0 or c.anki_reps > 0 or c.anki_ivl > 0
         for deck in result.decks
@@ -125,7 +143,8 @@ def parse_apkg(path: str | Path) -> ImportResult:
     return result
 
 
-def _parse_legacy(path: Path, names: list[str]) -> ImportResult:
+def _parse_legacy(path: Path, names: list[str]):
+    """Yield parse-progress tuples; return the finished ImportResult."""
     with zipfile.ZipFile(path) as zf:
         anki2 = [n for n in names if n.endswith(".anki2")]
         if not anki2:
@@ -150,7 +169,7 @@ def _parse_legacy(path: Path, names: list[str]) -> ImportResult:
         with os.fdopen(fd, "wb") as f:
             f.write(blob)
     try:
-        return _parse_db(tmp, media)
+        return (yield from _parse_db(tmp, media))
     finally:
         tmp.unlink(missing_ok=True)
 
@@ -179,8 +198,11 @@ def _source_crt(path: Path) -> int:
         return 0
 
 
-def _parse_with_anki(path: Path) -> ImportResult:
-    """Import a modern (protobuf) package with Anki's own backend."""
+def _parse_with_anki(path: Path):
+    """Import a modern (protobuf) package with Anki's own backend.
+
+    Yield ``("parse", done, total)`` as cards are read; return the finished
+    ImportResult."""
     from anki.collection import Collection, ImportAnkiPackageRequest
 
     workdir = Path(tempfile.mkdtemp(prefix="smarthole-apkg-"))
@@ -205,7 +227,9 @@ def _parse_with_anki(path: Path) -> ImportResult:
         finally:
             db.close()
         decks: dict[str, ImportedDeck] = {}
-        for cid in col.find_cards(""):
+        cids = col.find_cards("")
+        total = len(cids)
+        for done, cid in enumerate(cids, start=1):
             card = col.get_card(cid)
             note = card.note()
             deck_name = col.decks.name(card.did)
@@ -234,6 +258,8 @@ def _parse_with_anki(path: Path) -> ImportResult:
             )
             if sum(len(d.cards) for d in decks.values()) > MAX_CARDS:
                 raise ValueError(f"Import exceeds {MAX_CARDS} cards")
+            if done == total or done % PROGRESS_EVERY == 0:
+                yield ("parse", done, total)
     finally:
         col.close()
         shutil.rmtree(workdir, ignore_errors=True)
@@ -281,7 +307,9 @@ def _collection_crt(conn: sqlite3.Connection, tables: set[str]) -> int:
         return 0
 
 
-def _parse_db(db_path: Path, media: dict[str, bytes]) -> ImportResult:
+def _parse_db(db_path: Path, media: dict[str, bytes]):
+    """Yield ``("parse", done, total)`` as cards are read; return the
+    finished ImportResult."""
     conn = sqlite3.connect(db_path)
     try:
         tables = {
@@ -297,9 +325,12 @@ def _parse_db(db_path: Path, media: dict[str, bytes]) -> ImportResult:
         conn.close()
 
     decks: dict[str, ImportedDeck] = {}
-    for _cid, nid, did, ord_, queue in cards:
+    total = len(cards)
+    for done, (_cid, nid, did, ord_, queue) in enumerate(cards, start=1):
         note = notes.get(nid)
         if note is None:
+            if done == total or done % PROGRESS_EVERY == 0:
+                yield ("parse", done, total)
             continue
         guid, mid, fields = note
         deck_name = deck_names.get(did, f"Imported deck {did}")
@@ -329,6 +360,8 @@ def _parse_db(db_path: Path, media: dict[str, bytes]) -> ImportResult:
         )
         if sum(len(d.cards) for d in decks.values()) > MAX_CARDS:
             raise ValueError(f"Import exceeds {MAX_CARDS} cards")
+        if done == total or done % PROGRESS_EVERY == 0:
+            yield ("parse", done, total)
     return ImportResult(decks=list(decks.values()), media=media)
 
 

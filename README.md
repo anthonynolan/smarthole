@@ -41,8 +41,13 @@ cd smarthole-client && npm run dev   # proxied /api -> localhost:8123
    folder (from WSL: `/mnt/c/Users/<you>/AppData/Roaming/Anki2/<profile>/backups`).
    Modern (23.10+) and legacy formats work; card content is rendered with
    Anki's own importer, and scheduling imports with it (re-import to refresh).
-3. Review due cards with Again / Hard / Good / Easy; browse the deck, add
-   cards, and check Stats from the same menu.
+   The Import view streams live progress — cards read, then cards saved —
+   from `POST /api/import?stream=true` (plain `POST /api/import` still
+   returns one JSON result).
+3. Review due cards with Again / Hard / Good / Easy; the review screen shows
+   how many are due today across the selected scope. Browse the deck, add
+   cards, and check Stats from the same menu. Dates render unambiguously as
+   `12-Nov'26`.
 
 ## Scheduling
 

@@ -81,6 +81,7 @@ export interface Deck {
   name: string;
   total: number;
   due: number;
+  due_today: number;
   new: number;
 }
 
@@ -98,11 +99,17 @@ export interface ReviewCard {
   due: string;
   state: string;
   reps: number;
+  /** Next-due ISO timestamps per rating ("1".."4"), for button labels. */
+  intervals?: Record<string, string>;
 }
 
-export async function getNext(deckId: string | ''): Promise<ReviewCard[]> {
+export async function getNext(
+  deckId: string | '',
+  excludeId?: string,
+): Promise<ReviewCard[]> {
   const q = deckId ? `?deck_id=${encodeURIComponent(deckId)}&limit=1` : '?limit=1';
-  const res = await apiFetch(`/next${q}`);
+  const ex = excludeId ? `&exclude=${encodeURIComponent(excludeId)}` : '';
+  const res = await apiFetch(`/next${q}${ex}`);
   const data = await readJson(res);
   return data.cards ?? [];
 }
@@ -113,6 +120,54 @@ export async function gradeCard(cardId: string, rating: number): Promise<ReviewC
     body: JSON.stringify({ rating }),
   });
   return readJson(res);
+}
+
+export interface AiSuggestion {
+  front: string;
+  back: string;
+}
+
+export async function requestAiReview(
+  cardId: string,
+): Promise<{ suggestions: AiSuggestion[]; model: string }> {
+  const res = await apiFetch(`/cards/${encodeURIComponent(cardId)}/ai-review`, {
+    method: 'POST',
+    body: JSON.stringify({}),
+  });
+  return readJson(res);
+}
+
+export async function deleteCard(cardId: string): Promise<void> {
+  const res = await apiFetch(`/cards/${encodeURIComponent(cardId)}`, {
+    method: 'DELETE',
+  });
+  await readJson(res);
+}
+
+export interface UpdatedCard {
+  card_id: string;
+  deck_id: string;
+  front_html: string;
+  back_html: string;
+}
+
+export async function updateCard(
+  cardId: string,
+  front: string,
+  back: string,
+): Promise<UpdatedCard> {
+  const res = await apiFetch(`/cards/${encodeURIComponent(cardId)}`, {
+    method: 'PUT',
+    body: JSON.stringify({ front, back }),
+  });
+  return readJson(res);
+}
+
+/** Editable plain text from card HTML (used to prefill the edit fields). */
+export function htmlToText(html: string): string {
+  const el = document.createElement('div');
+  el.innerHTML = html;
+  return (el.textContent ?? '').replace(/\n{3,}/g, '\n\n').trim();
 }
 
 export type BrowseSort = 'due' | 'last_review';
@@ -126,6 +181,8 @@ export interface BrowseCard {
   state: string;
   reps: number;
   suspended: boolean;
+  /** True when the card counts as due today (drives the divider line). */
+  due_today: boolean;
 }
 
 export const BROWSE_PAGE = 20;
@@ -136,9 +193,11 @@ export async function browseCards(
   direction: BrowseDir,
   skip: number,
   limit: number = BROWSE_PAGE,
+  search?: string,
 ): Promise<{ cards: BrowseCard[]; total: number }> {
-  const q =
+  let q =
     `?sort=${sort}&direction=${direction}&skip=${skip}&limit=${limit}`;
+  if (search) q += `&q=${encodeURIComponent(search)}`;
   const res = await apiFetch(`/decks/${encodeURIComponent(deckId)}/cards${q}`);
   return readJson(res);
 }
@@ -173,6 +232,61 @@ export async function importPackage(file: File): Promise<ImportResult> {
   return readJson(res);
 }
 
+export interface ImportProgress {
+  stage: string;
+  done: number;
+  total: number;
+}
+
+/**
+ * Import with live progress. Reads the NDJSON event stream from
+ * `POST /api/import?stream=true`, calling `onProgress` with cards-processed
+ * counts, and resolves with the final import result.
+ */
+export async function importPackageStream(
+  file: File,
+  onProgress: (p: ImportProgress) => void,
+): Promise<ImportResult> {
+  const form = new FormData();
+  form.append('file', file);
+  const res = await fetch('/api/import?stream=true', {
+    method: 'POST',
+    credentials: 'same-origin',
+    body: form,
+  });
+  if (!res.ok) {
+    await readJson(res);
+    throw new Error('Import failed.');
+  }
+  if (!res.body) {
+    return importPackage(file);
+  }
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split('\n');
+    buffer = lines.pop() ?? '';
+    for (const raw of lines) {
+      if (!raw.trim()) continue;
+      const event = JSON.parse(raw);
+      if (event.error) throw new Error(event.error);
+      if (event.complete) return event.result as ImportResult;
+      if (event.stage) {
+        onProgress({
+          stage: event.stage,
+          done: event.done,
+          total: event.total,
+        });
+      }
+    }
+  }
+  throw new Error('Import ended without a result.');
+}
+
 export interface Stats {
   totals: {
     cards: number;
@@ -196,15 +310,63 @@ export async function getStats(): Promise<Stats> {
   return readJson(res);
 }
 
-/** Compact date like the legacy page: "M/d h:mm", em dash when missing. */
+const MONTHS = [
+  'Jan',
+  'Feb',
+  'Mar',
+  'Apr',
+  'May',
+  'Jun',
+  'Jul',
+  'Aug',
+  'Sep',
+  'Oct',
+  'Nov',
+  'Dec',
+];
+
+/**
+ * Unambiguous day-month-year like "12-Nov'26", em dash when missing.
+ * Date-only strings ("2026-11-08", as used by the stats forecast) are read
+ * as UTC days so the timezone cannot shift them; full timestamps use their
+ * UTC day for the same reason.
+ */
+/**
+ * Human interval from now until an ISO due timestamp, Anki-style:
+ * "10m", "3h", "23d", "4mo", "2y". Empty string when unknown.
+ */
+export function fmtInterval(iso: string | null | undefined): string {
+  if (!iso) return '';
+  const ms = new Date(iso).getTime() - Date.now();
+  if (Number.isNaN(ms)) return '';
+  const mins = Math.max(1, Math.round(ms / 60000));
+  if (mins < 60) return `${mins}m`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `${hours}h`;
+  const days = Math.floor(hours / 24);
+  if (days < 30) return `${days}d`;
+  const months = Math.floor(days / 30.44);
+  if (months < 12) return `${months}mo`;
+  return `${Math.floor(months / 12)}y`;
+}
+
 export function fmtDate(iso: string | null | undefined): string {
   if (!iso) return '—';
-  const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return '—';
-  return d.toLocaleString(undefined, {
-    month: 'numeric',
-    day: 'numeric',
-    hour: 'numeric',
-    minute: '2-digit',
-  });
+  const bare = /^(\d{4})-(\d{2})-(\d{2})/.exec(iso);
+  let y: number;
+  let m: number;
+  let d: number;
+  if (bare) {
+    y = Number(bare[1]);
+    m = Number(bare[2]);
+    d = Number(bare[3]);
+  } else {
+    const dt = new Date(iso);
+    if (Number.isNaN(dt.getTime())) return '—';
+    y = dt.getUTCFullYear();
+    m = dt.getUTCMonth() + 1;
+    d = dt.getUTCDate();
+  }
+  if (m < 1 || m > 12 || d < 1 || d > 31) return '—';
+  return `${d}-${MONTHS[m - 1]}'${String(y).slice(2)}`;
 }

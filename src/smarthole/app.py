@@ -1,7 +1,10 @@
 """smarthole: hosted Anki reviewer with FSRS scheduling on MongoDB Atlas."""
 
 import hashlib
+import json
 import mimetypes
+import os
+import re
 import tempfile
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
@@ -19,14 +22,20 @@ from fastapi import (
     UploadFile,
     status,
 )
-from fastapi.responses import HTMLResponse, JSONResponse, Response
+from fastapi.responses import (
+    HTMLResponse,
+    JSONResponse,
+    Response,
+    StreamingResponse,
+)
 from fastapi.staticfiles import StaticFiles
+from mongoengine import Q
 from mongoengine.connection import get_connection
 from pydantic import BaseModel, EmailStr
 
 load_dotenv()
 
-from . import apkg_import, fsrs_service, mongo_connection
+from . import ai_review, apkg_import, fsrs_service, mongo_connection
 from .auth import (
     SESSION_COOKIE,
     SESSION_DAYS,
@@ -59,6 +68,11 @@ class CardBody(BaseModel):
     back: str
 
 
+class CardUpdateBody(BaseModel):
+    front: str
+    back: str
+
+
 class GoogleBody(BaseModel):
     token: str
 
@@ -67,10 +81,48 @@ def utcnow() -> datetime:
     return datetime.now(UTC)
 
 
+# MCP (Streamable HTTP) for external AI clients such as ChatGPT.
+# Disable with MCP_ENABLED=0.
+_MCP_ENABLED = os.getenv("MCP_ENABLED", "1") == "1"
+
+
+class _McpDispatch:
+    """Stable mount target forwarding to the current lifespan's MCP app.
+
+    The MCP SDK allows a single session-manager run per server instance, so
+    each ASGI lifespan gets a fresh sub-app (this also keeps repeated
+    TestClient lifespans in the test suite working).
+    """
+
+    def __init__(self):
+        self.current = None
+
+    async def __call__(self, scope, receive, send):
+        assert self.current is not None, "MCP app not initialized"
+        await self.current(scope, receive, send)
+
+
+_mcp_dispatch = _McpDispatch()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     mongo_connection.init()
-    yield
+    if not _MCP_ENABLED:
+        yield
+        return
+    # Imported here so MCP_ENABLED=0 avoids importing the mcp package entirely.
+    from .mcp_server import create_mcp_server
+
+    sub_app = create_mcp_server().streamable_http_app()
+    _mcp_dispatch.current = sub_app
+    try:
+        # Starlette does not propagate lifespan to mounted sub-apps, so run the
+        # MCP session manager's lifespan explicitly.
+        async with sub_app.router.lifespan_context(sub_app):
+            yield
+    finally:
+        _mcp_dispatch.current = None
 
 
 def _anki_sched(icard) -> dict:
@@ -118,7 +170,7 @@ def _refresh_imported_state(user: User, card: Card, icard) -> None:
 
 
 def create_app() -> FastAPI:
-    app = FastAPI(title="smarthole")
+    app = FastAPI(title="smarthole", lifespan=lifespan)
 
     @app.middleware("http")
     async def ensure_mongo_connection(request, call_next):
@@ -218,14 +270,22 @@ def create_app() -> FastAPI:
                     user=user, card__in=active_ids, reps__gt=0, due__lte=utcnow()
                 ).count()
                 new = CardState.objects(user=user, card__in=active_ids, reps=0).count()
+                day_start = utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+                due_today = CardState.objects(
+                    user=user,
+                    card__in=active_ids,
+                    reps__gt=0,
+                    due__lt=day_start + timedelta(days=1),
+                ).count()
             else:
-                due = new = 0
+                due = new = due_today = 0
             out.append(
                 {
                     "id": str(deck.id),
                     "name": deck.name,
                     "total": len(cards),
                     "due": due,
+                    "due_today": due_today,
                     "new": new,
                 }
             )
@@ -238,17 +298,25 @@ def create_app() -> FastAPI:
         direction: Literal["asc", "desc"] = Query(default="asc"),
         skip: int = Query(default=0, ge=0),
         limit: int = Query(default=20, ge=1, le=100),
+        q: str | None = Query(default=None),
         user: User = Depends(get_current_user),
     ):
         deck = Deck.objects(owner=user, id=deck_id).first()
         if deck is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "Deck not found")
-        card_ids = [c.id for c in Card.objects(deck=deck)]
+        cards_query = Card.objects(deck=deck)
+        if q and q.strip():
+            needle = q.strip()
+            cards_query = cards_query.filter(
+                Q(front_html__icontains=needle) | Q(back_html__icontains=needle)
+            )
+        card_ids = [c.id for c in cards_query]
         total = (
             CardState.objects(user=user, card__in=card_ids).count() if card_ids else 0
         )
         states = _paged_states(user, card_ids, sort, direction, skip, limit)
         cards = {c.id: c for c in Card.objects(id__in=[s.card.id for s in states])}
+        tomorrow = _day_start() + timedelta(days=1)
         rows = []
         for s in states:
             card = cards.get(s.card.id)
@@ -263,6 +331,12 @@ def create_app() -> FastAPI:
                     "state": s.state,
                     "reps": s.reps,
                     "suspended": card.suspended,
+                    "due_today": (
+                        s.reps > 0
+                        and not card.suspended
+                        and s.due is not None
+                        and fsrs_service.ensure_aware(s.due) < tomorrow
+                    ),
                 }
             )
         return {"cards": rows, "total": total}
@@ -295,9 +369,72 @@ def create_app() -> FastAPI:
         ).save()
         return {"card_id": str(card.id), "deck_id": str(deck.id)}
 
+    @app.put("/api/cards/{card_id}")
+    def update_card(
+        card_id: str, body: CardUpdateBody, user: User = Depends(get_current_user)
+    ):
+        if not body.front.strip() or not body.back.strip():
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST, "front and back must be non-empty"
+            )
+        try:
+            card = Card.objects(id=card_id).first()
+        except Exception:
+            card = None
+        if card is None or card.deck.owner.id != user.id:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Card not found")
+        card.update(
+            set__front_html=apkg_import.sanitize(body.front),
+            set__back_html=apkg_import.sanitize(body.back),
+        )
+        card.reload()
+        return {
+            "card_id": str(card.id),
+            "deck_id": str(card.deck.id),
+            "front_html": card.front_html,
+            "back_html": card.back_html,
+        }
+
+    @app.post("/api/cards/{card_id}/ai-review")
+    def ai_review_card(card_id: str, user: User = Depends(get_current_user)):
+        try:
+            card = Card.objects(id=card_id).first()
+        except Exception:
+            card = None
+        if card is None or card.deck.owner.id != user.id:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Card not found")
+        try:
+            suggestions, model = ai_review.review_card_with_ai(
+                card.front_html, card.back_html
+            )
+        except RuntimeError as exc:
+            raise HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)
+            ) from exc
+        except Exception as exc:
+            raise HTTPException(
+                status.HTTP_502_BAD_GATEWAY, f"AI review failed: {exc}"
+            ) from exc
+        return {"suggestions": suggestions, "model": model}
+
+    @app.delete("/api/cards/{card_id}")
+    def delete_card(card_id: str, user: User = Depends(get_current_user)):
+        try:
+            card = Card.objects(id=card_id).first()
+        except Exception:
+            card = None
+        if card is None or card.deck.owner.id != user.id:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Card not found")
+        CardState.objects(card=card).delete()
+        Review.objects(card=card).delete()
+        card.delete()
+        return {"deleted": card_id}
+
     @app.post("/api/import", status_code=201)
     def import_apkg(
-        file: UploadFile = File(...), user: User = Depends(get_current_user)
+        file: UploadFile = File(...),
+        stream: bool = Query(default=False),
+        user: User = Depends(get_current_user),
     ):
         name = (file.filename or "").lower()
         if not name.endswith((".apkg", ".colpkg")):
@@ -307,6 +444,111 @@ def create_app() -> FastAPI:
         with tempfile.NamedTemporaryFile(suffix=".apkg", delete=False) as tmp:
             tmp.write(file.file.read())
             tmp_path = tmp.name
+
+        def run_save(result):
+            """Yield ("save", done, total); return the result payload dict."""
+            filename_to_url = _store_media(result.media)
+            total = sum(len(ideck.cards) for ideck in result.decks)
+            done = 0
+            imported = 0
+            for ideck in result.decks:
+                deck = Deck.objects(owner=user, name=ideck.name).first()
+                if deck is None:
+                    deck = Deck(
+                        owner=user, name=ideck.name, source_apkg=file.filename
+                    ).save()
+                existing = {
+                    (c.anki_nid, c.anki_ord): c for c in Card.objects(deck=deck)
+                }
+                for icard in ideck.cards:
+                    key = (icard.anki_nid, icard.anki_ord)
+                    old = existing.get(key)
+                    if old is None:
+                        existing[key] = None
+                        card = Card(
+                            deck=deck,
+                            front_html=apkg_import.rewrite_media_refs(
+                                icard.front_html, filename_to_url
+                            ),
+                            back_html=apkg_import.rewrite_media_refs(
+                                icard.back_html, filename_to_url
+                            ),
+                            anki_nid=icard.anki_nid,
+                            anki_ord=icard.anki_ord,
+                            anki_guid=icard.anki_guid,
+                            suspended=icard.suspended,
+                            new_position=icard.anki_due,
+                        ).save()
+                        CardState(
+                            user=user,
+                            card=card,
+                            new_position=icard.anki_due,
+                            **fsrs_service.state_from_anki(_anki_sched(icard)),
+                        ).save()
+                        imported += 1
+                    else:
+                        if not old.new_position and icard.anki_due:
+                            old.update(set__new_position=icard.anki_due)
+                            skipped = CardState.objects(user=user, card=old).first()
+                            if skipped is not None and not skipped.new_position:
+                                skipped.update(set__new_position=icard.anki_due)
+                        if icard.suspended != old.suspended:
+                            old.update(set__suspended=icard.suspended)
+                        if result.scheduling:
+                            _refresh_imported_state(user, old, icard)
+                    done += 1
+                    if done == total or done % apkg_import.PROGRESS_EVERY == 0:
+                        yield ("save", done, total)
+            return {
+                "imported": imported,
+                "decks": len(result.decks),
+                "scheduling": result.scheduling,
+                "due": _review_due_count(user),
+            }
+
+        def drain(gen):
+            while True:
+                try:
+                    next(gen)
+                except StopIteration as stop:
+                    return stop.value
+
+        def stream_lines():
+            """NDJSON progress events, ending with a complete (or error) line.
+
+            With ``?stream=true`` the parse and save phases each report cards
+            processed, so the import button can show live progress.
+            """
+
+            def line(obj) -> bytes:
+                return (json.dumps(obj) + "\n").encode("utf-8")
+
+            try:
+                yield line({"stage": "upload", "done": 1, "total": 1})
+                events = apkg_import.parse_apkg_events(tmp_path)
+                while True:
+                    try:
+                        stage, done, total = next(events)
+                    except StopIteration as stop:
+                        parsed = stop.value
+                        break
+                    yield line({"stage": stage, "done": done, "total": total})
+                save = run_save(parsed)
+                while True:
+                    try:
+                        _stage, done, total = next(save)
+                    except StopIteration as stop:
+                        payload = stop.value
+                        break
+                    yield line({"stage": "save", "done": done, "total": total})
+                yield line({"complete": True, "result": payload})
+            except Exception as exc:
+                yield line({"error": f"Bad package: {exc}"})
+            finally:
+                Path(tmp_path).unlink(missing_ok=True)
+
+        if stream:
+            return StreamingResponse(stream_lines(), media_type="application/x-ndjson")
         try:
             result = apkg_import.parse_apkg(tmp_path)
         except Exception as exc:
@@ -315,64 +557,13 @@ def create_app() -> FastAPI:
             ) from exc
         finally:
             Path(tmp_path).unlink(missing_ok=True)
-
-        filename_to_url = _store_media(result.media)
-        imported = 0
-        for ideck in result.decks:
-            deck = Deck.objects(owner=user, name=ideck.name).first()
-            if deck is None:
-                deck = Deck(
-                    owner=user, name=ideck.name, source_apkg=file.filename
-                ).save()
-            existing = {(c.anki_nid, c.anki_ord): c for c in Card.objects(deck=deck)}
-            for icard in ideck.cards:
-                key = (icard.anki_nid, icard.anki_ord)
-                old = existing.get(key)
-                if old is not None:
-                    if not old.new_position and icard.anki_due:
-                        old.update(set__new_position=icard.anki_due)
-                        skipped = CardState.objects(user=user, card=old).first()
-                        if skipped is not None and not skipped.new_position:
-                            skipped.update(set__new_position=icard.anki_due)
-                    if icard.suspended != old.suspended:
-                        old.update(set__suspended=icard.suspended)
-                    if result.scheduling:
-                        _refresh_imported_state(user, old, icard)
-                    continue
-                existing[key] = None
-                card = Card(
-                    deck=deck,
-                    front_html=apkg_import.rewrite_media_refs(
-                        icard.front_html, filename_to_url
-                    ),
-                    back_html=apkg_import.rewrite_media_refs(
-                        icard.back_html, filename_to_url
-                    ),
-                    anki_nid=icard.anki_nid,
-                    anki_ord=icard.anki_ord,
-                    anki_guid=icard.anki_guid,
-                    suspended=icard.suspended,
-                    new_position=icard.anki_due,
-                ).save()
-                CardState(
-                    user=user,
-                    card=card,
-                    new_position=icard.anki_due,
-                    **fsrs_service.state_from_anki(_anki_sched(icard)),
-                ).save()
-                imported += 1
-        due_now = _review_due_count(user)
-        return {
-            "imported": imported,
-            "decks": len(result.decks),
-            "scheduling": result.scheduling,
-            "due": due_now,
-        }
+        return drain(run_save(result))
 
     @app.get("/api/next")
     def next_cards(
         deck_id: str | None = None,
         limit: int = 1,
+        exclude: str | None = None,
         user: User = Depends(get_current_user),
     ):
         limit = max(limit, 1)
@@ -382,6 +573,10 @@ def create_app() -> FastAPI:
             if deck is None:
                 raise HTTPException(status.HTTP_404_NOT_FOUND, "Deck not found")
         cards = _active_cards(user, deck)
+        if exclude:
+            # Lets the client preload the card after the current one: the
+            # current card is still due (ungraded), so skip it explicitly.
+            cards = {cid: c for cid, c in cards.items() if str(cid) != exclude}
         out = []
         review_query: dict = {
             "user": user,
@@ -408,17 +603,7 @@ def create_app() -> FastAPI:
         state = CardState.objects(user=user, card=card).first()
         if state is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "No state for this card")
-        current = {
-            "fsrs_card_id": state.fsrs_card_id,
-            "state": state.state,
-            "step": state.step,
-            "stability": state.stability,
-            "difficulty": state.difficulty,
-            "due": state.due,
-            "last_review": state.last_review,
-            "reps": state.reps,
-            "lapses": state.lapses,
-        }
+        current = _scheduler_fields(state)
         now = utcnow()
         first_grading = state.reps == 0
         updated = fsrs_service.apply_rating(current, body.rating, now)
@@ -530,6 +715,53 @@ def create_app() -> FastAPI:
             "/assets", StaticFiles(directory=CLIENT_DIST / "assets"), name="assets"
         )
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+    if _MCP_ENABLED:
+        from mcp.server.auth.routes import create_auth_routes
+        from mcp.server.auth.settings import (
+            ClientRegistrationOptions,
+            RevocationOptions,
+        )
+        from pydantic import AnyHttpUrl, TypeAdapter
+
+        from .mcp_oauth_provider import SmartholeOAuthProvider
+        from .mcp_oauth_routes import router as mcp_oauth_router
+        from .mcp_server import MCP_ISSUER_URL as _MCP_ISSUER_URL
+        from .mcp_server import MCP_RESOURCE_URL as _MCP_RESOURCE_URL
+        from .mcp_server import MCP_SCOPES as _MCP_SCOPES
+
+        _mcp_oauth_provider = SmartholeOAuthProvider(
+            resource_url=_MCP_RESOURCE_URL, allowed_scopes=list(_MCP_SCOPES)
+        )
+        _mcp_issuer = str(TypeAdapter(AnyHttpUrl).validate_python(_MCP_ISSUER_URL))
+        for _auth_route in create_auth_routes(
+            _mcp_oauth_provider,
+            issuer_url=TypeAdapter(AnyHttpUrl).validate_python(_mcp_issuer),
+            client_registration_options=ClientRegistrationOptions(
+                enabled=True,
+                valid_scopes=list(_MCP_SCOPES),
+                default_scopes=list(_MCP_SCOPES),
+            ),
+            revocation_options=RevocationOptions(enabled=True),
+        ):
+            app.router.routes.append(_auth_route)
+        app.include_router(mcp_oauth_router)
+
+        app.mount("/mcp", _mcp_dispatch)
+
+        @app.get("/.well-known/oauth-protected-resource/mcp")
+        def mcp_protected_resource_metadata():
+            """RFC 9728 metadata so OAuth clients can discover the AS."""
+            base = os.getenv(
+                "MCP_PUBLIC_BASE_URL", "https://smarthole.cathalanddad.com"
+            )
+            return {
+                "resource": f"{base.rstrip('/')}/mcp",
+                "authorization_servers": [_mcp_issuer],
+                "scopes_supported": list(_MCP_SCOPES),
+                "bearer_methods_supported": ["header"],
+            }
+
     return app
 
 
@@ -664,16 +896,70 @@ def plain_text(html: str, limit: int = 120) -> str:
     return text
 
 
+_FRONT_ECHO_RE = re.compile(r"\s*<hr\b[^>]*>", re.IGNORECASE)
+
+
+def strip_front_echo(front_html: str, back_html: str) -> str:
+    """Drop the Anki ``{{FrontSide}}`` echo at the start of the answer side.
+
+    Answer templates are usually ``{{FrontSide}}<hr>{{Back}}``, so the stored
+    answer begins with a copy of the question. The question is already on
+    screen in review mode, so strip that prefix (question + the <hr>) and
+    return just the answer. Anything else is returned untouched — in
+    particular an answer that merely starts with the same words but has no
+    <hr> separator is left alone.
+    """
+    if not front_html or not back_html:
+        return back_html
+    if not back_html.startswith(front_html):
+        return back_html
+    rest = back_html[len(front_html):]
+    match = _FRONT_ECHO_RE.match(rest)
+    if not match:
+        return back_html
+    return rest[match.end():]
+
+
+def _scheduler_fields(state: CardState) -> dict:
+    """Scheduler inputs for one card's state (also the preview basis)."""
+    return {
+        "fsrs_card_id": state.fsrs_card_id,
+        "state": state.state,
+        "step": state.step,
+        "stability": state.stability,
+        "difficulty": state.difficulty,
+        "due": state.due,
+        "last_review": state.last_review,
+        "reps": state.reps,
+        "lapses": state.lapses,
+    }
+
+
+def _preview_intervals(state: CardState, now: datetime) -> dict:
+    """Next-due preview per rating, so the UI can label the grade buttons."""
+    current = _scheduler_fields(state)
+    previews = {}
+    for rating in (1, 2, 3, 4):
+        try:
+            previews[str(rating)] = fsrs_service.apply_rating(
+                current, rating, now
+            )["due"].isoformat()
+        except Exception:
+            continue
+    return previews
+
+
 def _present_state(state: CardState) -> dict:
     card = state.card
     return {
         "card_id": str(card.id),
         "deck_id": str(card.deck.id),
         "front_html": card.front_html,
-        "back_html": card.back_html,
+        "back_html": strip_front_echo(card.front_html, card.back_html),
         "due": state.due.isoformat(),
         "state": state.state,
         "reps": state.reps,
+        "intervals": _preview_intervals(state, utcnow()),
     }
 
 

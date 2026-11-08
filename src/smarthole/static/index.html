@@ -5,8 +5,9 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>smarthole</title>
 <style>
-  body { font-family: system-ui, sans-serif; max-width: 640px; margin: 2rem auto; padding: 0 1rem; }
+  body { font-family: system-ui, sans-serif; max-width: 640px; margin: 2rem auto; padding: 0 1rem; line-height: 1.6; }
   .card { border: 1px solid #ccc; border-radius: 8px; padding: 1.5rem; margin: 1rem 0; min-height: 120px; }
+  #front, #back { font-family: Georgia, "Times New Roman", Charter, serif; font-size: 1.25rem; line-height: 1.7; max-width: 68ch; overflow-wrap: break-word; }
   .row { display: flex; gap: .5rem; margin: .5rem 0; flex-wrap: wrap; }
   button { padding: .5rem 1rem; font-size: 1rem; cursor: pointer; }
   input, select { padding: .5rem; font-size: 1rem; }
@@ -232,11 +233,20 @@ async function initGoogle() {
 let sortKey = "due";
 let sortDir = "asc";
 
+var MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 function fmtDate(iso) {
   if (!iso) return "—";
-  return new Date(iso).toLocaleString(undefined, {
-    month: "numeric", day: "numeric", hour: "numeric", minute: "2-digit",
-  });
+  var bare = /^(\d{4})-(\d{2})-(\d{2})/.exec(iso);
+  var y, m, d;
+  if (bare) {
+    y = Number(bare[1]); m = Number(bare[2]); d = Number(bare[3]);
+  } else {
+    var dt = new Date(iso);
+    if (Number.isNaN(dt.getTime())) return "—";
+    y = dt.getUTCFullYear(); m = dt.getUTCMonth() + 1; d = dt.getUTCDate();
+  }
+  if (m < 1 || m > 12 || d < 1 || d > 31) return "—";
+  return d + "-" + MONTHS[m - 1] + "'" + String(y).slice(2);
 }
 
 const BROWSE_PAGE = 20;
