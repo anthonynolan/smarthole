@@ -91,9 +91,33 @@ export async function getDecks(): Promise<Deck[]> {
   return data.decks ?? [];
 }
 
+export interface CardMeta {
+  card_id: string;
+  deck_id: string;
+  deck_name: string;
+  created_at?: string | null;
+  suspended: boolean;
+  deleted: boolean;
+  deleted_at?: string | null;
+  new_position: number;
+  anki_nid?: number | null;
+  anki_ord?: number | null;
+  anki_guid?: string | null;
+  due?: string | null;
+  last_review?: string | null;
+  state: number;
+  step: number;
+  stability?: number | null;
+  difficulty?: number | null;
+  reps: number;
+  lapses: number;
+  introduced_at?: string | null;
+}
+
 export interface ReviewCard {
   card_id: string;
   deck_id: string;
+  deck_name?: string;
   front_html: string;
   back_html: string;
   due: string;
@@ -102,6 +126,8 @@ export interface ReviewCard {
   created_at?: string | null;
   /** Next-due ISO timestamps per rating ("1".."4"), for button labels. */
   intervals?: Record<string, string>;
+  /** Full card + scheduling metadata for troubleshooting. */
+  meta?: CardMeta | null;
 }
 
 export async function getNext(
@@ -155,20 +181,27 @@ export interface AiReviewStreamResult {
 /**
  * Stream an AI review, calling `onText` with the full text received so far
  * as each chunk arrives, and resolving with the parsed final result.
+ * `onStatus` reports the call phases: sent → awaiting response →
+ * streaming → finished.
  */
+export type AiReviewStatus = 'sent' | 'awaiting response' | 'streaming' | 'finished';
+
 export async function requestAiReviewStream(
   cardId: string,
   opts: { mode: AiReviewMode; question?: string },
   onText: (fullText: string) => void,
+  onStatus?: (status: AiReviewStatus) => void,
 ): Promise<AiReviewStreamResult> {
   const q =
     `?mode=${opts.mode}` +
     (opts.mode === 'custom' ? `&question=${encodeURIComponent(opts.question ?? '')}` : '');
+  onStatus?.('sent');
   const res = await apiFetch(`/cards/${encodeURIComponent(cardId)}/ai-review/stream${q}`);
   if (!res.ok) {
     const text = await res.text().catch(() => res.statusText);
     throw new Error(text || `Request failed: ${res.status}`);
   }
+  onStatus?.('awaiting response');
   if (!res.body) {
     const fallback = await requestAiReview(
       cardId,
@@ -200,9 +233,11 @@ export async function requestAiReviewStream(
       if (event.error) throw new Error(event.error);
       if (typeof event.delta === 'string') {
         raw += event.delta;
+        onStatus?.('streaming');
         onText(raw);
       }
       if (event.done) {
+        onStatus?.('finished');
         return {
           suggestions: event.suggestions ?? [],
           answer: event.answer ?? null,
@@ -219,9 +254,11 @@ export async function requestAiReviewStream(
     if (event.error) throw new Error(event.error);
     if (typeof event.delta === 'string') {
       raw += event.delta;
+      onStatus?.('streaming');
       onText(raw);
     }
     if (event.done) {
+      onStatus?.('finished');
       return {
         suggestions: event.suggestions ?? [],
         answer: event.answer ?? null,
@@ -233,9 +270,24 @@ export async function requestAiReviewStream(
   throw new Error('AI review ended without a result.');
 }
 
-export async function deleteCard(cardId: string): Promise<void> {
-  const res = await apiFetch(`/cards/${encodeURIComponent(cardId)}`, {
-    method: 'DELETE',
+/**
+ * Delete a card. Default is a logical delete (restorable from Browse's
+ * "Show deleted" view); `permanent` hard-deletes the card, its schedule,
+ * and its review history.
+ */
+export async function deleteCard(cardId: string, permanent = false): Promise<void> {
+  const res = await apiFetch(
+    `/cards/${encodeURIComponent(cardId)}${permanent ? '?permanent=true' : ''}`,
+    { method: 'DELETE' },
+  );
+  await readJson(res);
+}
+
+/** Undelete a logically deleted card (schedule/history are intact). */
+export async function restoreCard(cardId: string): Promise<void> {
+  const res = await apiFetch(`/cards/${encodeURIComponent(cardId)}/restore`, {
+    method: 'POST',
+    body: JSON.stringify({}),
   });
   await readJson(res);
 }
@@ -259,11 +311,21 @@ export async function updateCard(
   return readJson(res);
 }
 
-/** Editable plain text from card HTML (used to prefill the edit fields). */
+/**
+ * Editable plain text from card HTML (used to prefill the edit fields).
+ * Block boundaries (<br>, paragraphs, divs, list items, headings, <hr>)
+ * become newlines so line breaks survive the edit round-trip.
+ */
 export function htmlToText(html: string): string {
   const el = document.createElement('div');
-  el.innerHTML = html;
-  return (el.textContent ?? '').replace(/\n{3,}/g, '\n\n').trim();
+  el.innerHTML = (html ?? '')
+    .replace(/<(br|hr)\b[^>]*>/gi, '\n')
+    .replace(/<\/(p|div|li|tr|h1|h2|h3|h4|ul|ol|blockquote|pre)>/gi, '\n');
+  return (el.textContent ?? '')
+    .replace(/[ \t]+\n/g, '\n')
+    .replace(/\n[ \t]+/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
 }
 
 export type BrowseSort = 'due' | 'last_review';
@@ -277,6 +339,7 @@ export interface BrowseCard {
   state: string;
   reps: number;
   suspended: boolean;
+  deleted?: boolean;
   /** True when the card counts as due today (drives the divider line). */
   due_today: boolean;
 }
@@ -290,10 +353,12 @@ export async function browseCards(
   skip: number,
   limit: number = BROWSE_PAGE,
   search?: string,
+  showDeleted = false,
 ): Promise<{ cards: BrowseCard[]; total: number }> {
   let q =
     `?sort=${sort}&direction=${direction}&skip=${skip}&limit=${limit}`;
   if (search) q += `&q=${encodeURIComponent(search)}`;
+  if (showDeleted) q += '&show_deleted=true';
   const res = await apiFetch(`/decks/${encodeURIComponent(deckId)}/cards${q}`);
   return readJson(res);
 }

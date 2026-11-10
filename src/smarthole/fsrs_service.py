@@ -116,7 +116,12 @@ def _difficulty_from_factor(factor: int) -> float:
 
 
 def apply_rating(state: dict, rating_value: int, now: datetime | None = None) -> dict:
-    """Grade a card Again(1)/Hard(2)/Good(3)/Easy(4); return updated fields."""
+    """Grade a card Again(1)/Hard(2)/Good(3)/Easy(4); return updated fields.
+
+    One wave of due cards per day: intraday learning/relearning steps
+    (minutes) are clamped to the start of the next UTC day, so a card
+    graded today never comes due again until tomorrow.
+    """
     moment = ensure_aware(now) or datetime.now(UTC)
     rating = Rating(rating_value)
     card = _load(state)
@@ -124,6 +129,11 @@ def apply_rating(state: dict, rating_value: int, now: datetime | None = None) ->
     fields = _dump(reviewed)
     fields["reps"] = state.get("reps", 0) + 1
     fields["lapses"] = state.get("lapses", 0) + (1 if rating is Rating.Again else 0)
+    tomorrow = moment.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(
+        days=1
+    )
+    if fields["due"] is not None and ensure_aware(fields["due"]) < tomorrow:
+        fields["due"] = tomorrow
     return fields
 
 

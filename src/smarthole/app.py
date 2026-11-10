@@ -268,7 +268,7 @@ def create_app() -> FastAPI:
         decks = Deck.objects(owner=user)
         out = []
         for deck in decks:
-            cards = list(Card.objects(deck=deck))
+            cards = list(Card.objects(deck=deck, deleted__ne=True))
             active_ids = [c.id for c in cards if not c.suspended]
             if active_ids:
                 due = CardState.objects(
@@ -304,12 +304,19 @@ def create_app() -> FastAPI:
         skip: int = Query(default=0, ge=0),
         limit: int = Query(default=20, ge=1, le=100),
         q: str | None = Query(default=None),
+        show_deleted: bool = Query(default=False),
         user: User = Depends(get_current_user),
     ):
         deck = Deck.objects(owner=user, id=deck_id).first()
         if deck is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "Deck not found")
-        cards_query = Card.objects(deck=deck)
+        # Default view hides logically deleted cards; show_deleted=True
+        # shows *only* deleted cards (for restore / permanent delete).
+        # __ne matches pre-migration cards that lack the field entirely.
+        if show_deleted:
+            cards_query = Card.objects(deck=deck, deleted=True)
+        else:
+            cards_query = Card.objects(deck=deck, deleted__ne=True)
         if q and q.strip():
             needle = q.strip()
             cards_query = cards_query.filter(
@@ -336,6 +343,7 @@ def create_app() -> FastAPI:
                     "state": s.state,
                     "reps": s.reps,
                     "suspended": card.suspended,
+                    "deleted": bool(card.deleted),
                     "due_today": (
                         s.reps > 0
                         and not card.suspended
@@ -362,8 +370,8 @@ def create_app() -> FastAPI:
         new_position = max((c.new_position or 0 for c in existing), default=0) + 1
         card = Card(
             deck=deck,
-            front_html=apkg_import.sanitize(body.front),
-            back_html=apkg_import.sanitize(body.back),
+            front_html=apkg_import.render_plain_text(body.front),
+            back_html=apkg_import.render_plain_text(body.back),
             new_position=new_position,
         ).save()
         CardState(
@@ -386,11 +394,11 @@ def create_app() -> FastAPI:
             card = Card.objects(id=card_id).first()
         except Exception:
             card = None
-        if card is None or card.deck.owner.id != user.id:
+        if card is None or card.deck.owner.id != user.id or card.deleted:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "Card not found")
         card.update(
-            set__front_html=apkg_import.sanitize(body.front),
-            set__back_html=apkg_import.sanitize(body.back),
+            set__front_html=apkg_import.render_plain_text(body.front),
+            set__back_html=apkg_import.render_plain_text(body.back),
         )
         card.reload()
         return {
@@ -410,7 +418,7 @@ def create_app() -> FastAPI:
             card = Card.objects(id=card_id).first()
         except Exception:
             card = None
-        if card is None or card.deck.owner.id != user.id:
+        if card is None or card.deck.owner.id != user.id or card.deleted:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "Card not found")
         mode = (body.mode if body else "split") or "split"
         question = (body.question if body else None) or None
@@ -458,7 +466,7 @@ def create_app() -> FastAPI:
             card = Card.objects(id=card_id).first()
         except Exception:
             card = None
-        if card is None or card.deck.owner.id != user.id:
+        if card is None or card.deck.owner.id != user.id or card.deleted:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "Card not found")
         if mode == "custom" and not (question or "").strip():
             raise HTTPException(
@@ -513,17 +521,45 @@ def create_app() -> FastAPI:
         )
 
     @app.delete("/api/cards/{card_id}")
-    def delete_card(card_id: str, user: User = Depends(get_current_user)):
+    def delete_card(
+        card_id: str,
+        permanent: bool = Query(default=False),
+        user: User = Depends(get_current_user),
+    ):
+        """Delete a card.
+
+        Default is a logical delete (``deleted`` flag): the card, its
+        scheduling state, and its review history are all kept so the card
+        can be restored. ``?permanent=true`` hard-deletes the card *and*
+        its schedule/reviews — the only path that removes that metadata.
+        """
         try:
             card = Card.objects(id=card_id).first()
         except Exception:
             card = None
         if card is None or card.deck.owner.id != user.id:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "Card not found")
-        CardState.objects(card=card).delete()
-        Review.objects(card=card).delete()
-        card.delete()
-        return {"deleted": card_id}
+        if permanent:
+            CardState.objects(card=card).delete()
+            Review.objects(card=card).delete()
+            card.delete()
+            return {"deleted": card_id, "permanent": True}
+        if not card.deleted:
+            card.update(set__deleted=True, set__deleted_at=utcnow())
+        return {"deleted": card_id, "permanent": False}
+
+    @app.post("/api/cards/{card_id}/restore")
+    def restore_card(card_id: str, user: User = Depends(get_current_user)):
+        """Undelete a logically deleted card (schedule/history are intact)."""
+        try:
+            card = Card.objects(id=card_id).first()
+        except Exception:
+            card = None
+        if card is None or card.deck.owner.id != user.id:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Card not found")
+        if card.deleted:
+            card.update(set__deleted=False, unset__deleted_at=True)
+        return {"restored": card_id}
 
     @app.post("/api/import", status_code=201)
     def import_apkg(
@@ -693,7 +729,7 @@ def create_app() -> FastAPI:
         if body.rating not in (1, 2, 3, 4):
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "rating must be 1-4")
         card = Card.objects(id=card_id).first()
-        if card is None:
+        if card is None or card.deleted:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "Card not found")
         state = CardState.objects(user=user, card=card).first()
         if state is None:
@@ -731,7 +767,7 @@ def create_app() -> FastAPI:
     def stats(user: User = Depends(get_current_user)):
         deck_ids = [d.id for d in Deck.objects(owner=user)]
         cards = list(Card.objects(deck__in=deck_ids)) if deck_ids else []
-        active = {c.id: c for c in cards if not c.suspended}
+        active = {c.id: c for c in cards if not c.suspended and not c.deleted}
         states = (
             list(CardState.objects(user=user, card__in=list(active))) if active else []
         )
@@ -773,13 +809,14 @@ def create_app() -> FastAPI:
                     ),
                 }
             )
+        visible = [c for c in cards if not c.deleted]
         return {
             "totals": {
-                "cards": len(cards),
+                "cards": len(visible),
                 "new": new,
                 "learning": learning,
                 "review": review,
-                "suspended": len(cards) - len(active),
+                "suspended": len(visible) - len(active),
                 "due": due,
             },
             "today": {
@@ -901,12 +938,16 @@ def _day_start() -> datetime:
 
 
 def _active_cards(user: User, deck: Deck | None) -> dict:
-    """Active (non-suspended) cards by id, optionally scoped to one deck."""
+    """Active (non-suspended, non-deleted) cards by id, scoped to one deck."""
     if deck is not None:
-        found = Card.objects(deck=deck, suspended=False)
+        found = Card.objects(deck=deck, suspended=False, deleted__ne=True)
     else:
         deck_ids = [d.id for d in Deck.objects(owner=user)]
-        found = Card.objects(deck__in=deck_ids, suspended=False) if deck_ids else []
+        found = (
+            Card.objects(deck__in=deck_ids, suspended=False, deleted__ne=True)
+            if deck_ids
+            else []
+        )
     return {c.id: c for c in found}
 
 
@@ -1045,10 +1086,12 @@ def _preview_intervals(state: CardState, now: datetime) -> dict:
 
 
 def _present_state(state: CardState) -> dict:
+    """Review payload: card HTML plus full scheduling/metadata for debugging."""
     card = state.card
     return {
         "card_id": str(card.id),
         "deck_id": str(card.deck.id),
+        "deck_name": card.deck.name,
         "front_html": card.front_html,
         "back_html": strip_front_echo(card.front_html, card.back_html),
         "due": state.due.isoformat(),
@@ -1056,6 +1099,32 @@ def _present_state(state: CardState) -> dict:
         "reps": state.reps,
         "created_at": card.created_at.isoformat() if card.created_at else None,
         "intervals": _preview_intervals(state, utcnow()),
+        "meta": {
+            "card_id": str(card.id),
+            "deck_id": str(card.deck.id),
+            "deck_name": card.deck.name,
+            "created_at": card.created_at.isoformat() if card.created_at else None,
+            "suspended": bool(card.suspended),
+            "deleted": bool(card.deleted),
+            "deleted_at": card.deleted_at.isoformat() if card.deleted_at else None,
+            "new_position": card.new_position,
+            "anki_nid": card.anki_nid,
+            "anki_ord": card.anki_ord,
+            "anki_guid": card.anki_guid,
+            "due": state.due.isoformat() if state.due else None,
+            "last_review": state.last_review.isoformat()
+            if state.last_review
+            else None,
+            "state": state.state,
+            "step": state.step,
+            "stability": state.stability,
+            "difficulty": state.difficulty,
+            "reps": state.reps,
+            "lapses": state.lapses,
+            "introduced_at": state.introduced_at.isoformat()
+            if state.introduced_at
+            else None,
+        },
     }
 
 

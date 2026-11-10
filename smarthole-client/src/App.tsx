@@ -54,11 +54,14 @@ import {
   logout,
   register,
   requestAiReviewStream,
+  restoreCard,
   updateCard,
   htmlToText,
   type AiReviewMode,
+  type AiReviewStatus,
   type AiSuggestion,
   type BrowseCard,
+  type CardMeta,
   type Deck,
   type ReviewCard,
   type Stats,
@@ -90,6 +93,8 @@ const qaTextSx = {
   lineHeight: 1.75,
   maxWidth: '68ch',
   overflowWrap: 'break-word' as const,
+  // Preserve authored line breaks (older cards store bare newlines).
+  whiteSpace: 'pre-wrap' as const,
 };
 
 export default function App() {
@@ -402,6 +407,55 @@ function useDecks() {
   return { decks, error, refresh };
 }
 
+/** All stored metadata for one card, to troubleshoot data/system issues. */
+function CardMetaView({ meta, card }: { meta: CardMeta | null; card: ReviewCard }) {
+  const rows: Array<[string, string]> = meta
+    ? [
+        ['Card ID', meta.card_id],
+        ['Deck', `${meta.deck_name} (${meta.deck_id})`],
+        ['Created', fmtDate(meta.created_at ?? null)],
+        ['Suspended', String(meta.suspended)],
+        ['Deleted', meta.deleted ? `yes (at ${fmtDate(meta.deleted_at ?? null)})` : 'no'],
+        ['New position', String(meta.new_position)],
+        ['Anki note / ord', `${meta.anki_nid ?? '—'} / ${meta.anki_ord ?? '—'}`],
+        ['Anki GUID', meta.anki_guid ?? '—'],
+        ['Due', fmtDate(meta.due ?? null)],
+        ['Last review', fmtDate(meta.last_review ?? null)],
+        ['FSRS state', String(meta.state)],
+        ['Step', String(meta.step)],
+        ['Stability', meta.stability == null ? '—' : String(meta.stability)],
+        ['Difficulty', meta.difficulty == null ? '—' : String(meta.difficulty)],
+        ['Reps', String(meta.reps)],
+        ['Lapses', String(meta.lapses)],
+        ['Introduced', fmtDate(meta.introduced_at ?? null)],
+      ]
+    : [
+        ['Card ID', card.card_id],
+        ['Deck', card.deck_id],
+        ['Created', fmtDate(card.created_at ?? null)],
+        ['Due', fmtDate(card.due)],
+        ['State', String(card.state)],
+        ['Reps', String(card.reps)],
+      ];
+  return (
+    <Box sx={{ mt: 2 }} data-testid="card-metadata">
+      <Typography variant="subtitle2" gutterBottom>
+        Card metadata
+      </Typography>
+      <Table size="small" sx={{ tableLayout: 'fixed', width: '100%' }}>
+        <TableBody>
+          {rows.map(([label, value]) => (
+            <TableRow key={label}>
+              <TableCell sx={{ width: '12rem', color: 'text.secondary' }}>{label}</TableCell>
+              <TableCell sx={{ overflowWrap: 'break-word' }}>{value}</TableCell>
+            </TableRow>
+          ))}
+        </TableBody>
+      </Table>
+    </Box>
+  );
+}
+
 function ReviewView() {
   const { decks, error: decksError, refresh } = useDecks();
   const [deckId, setDeckId] = useState('');
@@ -427,6 +481,8 @@ function ReviewView() {
   const [deleteError, setDeleteError] = useState<string | null>(null);
   const [aiMs, setAiMs] = useState<number | null>(null);
   const [aiElapsed, setAiElapsed] = useState(0);
+  const [aiStatus, setAiStatus] = useState<AiReviewStatus | null>(null);
+  const [aiModel, setAiModel] = useState<string | null>(null);
   const [preloaded, setPreloaded] = useState<ReviewCard | null>(null);
   const [editing, setEditing] = useState(false);
   const [editFront, setEditFront] = useState('');
@@ -462,6 +518,8 @@ function ReviewView() {
     setAiSelected([]);
     setAiError(null);
     setAiMs(null);
+    setAiStatus(null);
+    setAiModel(null);
     setConfirmDelete(false);
     setDeleteError(null);
     try {
@@ -522,6 +580,8 @@ function ReviewView() {
     setAiSuggestions([]);
     setAiSelected([]);
     setAiMs(null);
+    setAiStatus(null);
+    setAiModel(null);
   };
 
   const runAiReview = async () => {
@@ -538,16 +598,20 @@ function ReviewView() {
     setAiSuggestions([]);
     setAiSelected([]);
     setAiMs(null);
+    setAiStatus(null);
+    setAiModel(null);
     const t0 = Date.now();
     try {
       const r = await requestAiReviewStream(
         card.card_id,
         aiMode === 'custom' ? { mode: 'custom', question: aiQuestion.trim() } : { mode: 'split' },
         (text) => setAiStreamed(text),
+        (status) => setAiStatus(status),
       );
       setAiSuggestions(r.suggestions);
       setAiSelected(r.suggestions.map(() => true));
       setAiAnswer(r.answer);
+      setAiModel(r.model || null);
     } catch (e) {
       setAiError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -724,44 +788,7 @@ function ReviewView() {
             >
               Edit
             </Button>
-            <Button
-              variant="outlined"
-              color="error"
-              onClick={() => setConfirmDelete(true)}
-              disabled={deleteBusy || aiLoading || editing}
-            >
-              Delete
-            </Button>
           </Box>
-          {deleteError && (
-            <Alert severity="error" sx={{ mt: 2 }}>
-              {deleteError}
-            </Alert>
-          )}
-          {confirmDelete && (
-            <Box sx={{ mt: 2, pt: 2, borderTop: '1px dashed #aaa' }}>
-              <Typography variant="subtitle1" gutterBottom>
-                Delete this card?
-              </Typography>
-              <Typography variant="body2" color="text.secondary" gutterBottom>
-                This removes the card, its scheduling state, and its review
-                history. This cannot be undone.
-              </Typography>
-              <Box sx={{ display: 'flex', gap: 1, mt: 1 }}>
-                <Button onClick={() => setConfirmDelete(false)} disabled={deleteBusy}>
-                  Keep card
-                </Button>
-                <Button
-                  variant="contained"
-                  color="error"
-                  onClick={confirmDeleteCard}
-                  disabled={deleteBusy}
-                >
-                  {deleteBusy ? 'Deleting…' : 'Delete card'}
-                </Button>
-              </Box>
-            </Box>
-          )}
           {editing && (
             <Box sx={{ mt: 2, pt: 2, borderTop: '1px dashed #aaa' }}>
               <Typography variant="subtitle1" gutterBottom>
@@ -774,6 +801,7 @@ function ReviewView() {
                   minRows={3}
                   value={editFront}
                   onChange={(e) => setEditFront(e.target.value)}
+                  helperText="Plain text — blank lines become line breaks; **bold**, *italic*, `code`, [links](https://…) are rendered."
                 />
                 <TextField
                   label="Answer"
@@ -781,6 +809,7 @@ function ReviewView() {
                   minRows={3}
                   value={editBack}
                   onChange={(e) => setEditBack(e.target.value)}
+                  helperText="Plain text — blank lines become line breaks; **bold**, *italic*, `code`, [links](https://…) are rendered."
                 />
               </Box>
               {editError && (
@@ -789,7 +818,7 @@ function ReviewView() {
                 </Alert>
               )}
               <Box sx={{ display: 'flex', gap: 1, mt: 2 }}>
-                <Button onClick={() => setEditing(false)} disabled={editBusy}>
+                <Button onClick={() => { setEditing(false); setConfirmDelete(false); }} disabled={editBusy}>
                   Cancel
                 </Button>
                 <Button
@@ -799,6 +828,46 @@ function ReviewView() {
                 >
                   {editBusy ? 'Saving…' : 'Save'}
                 </Button>
+              </Box>
+              <CardMetaView meta={card.meta ?? null} card={card} />
+              <Box sx={{ mt: 2, pt: 2, borderTop: '1px dashed #aaa' }}>
+                <Typography variant="subtitle2" gutterBottom>
+                  Delete this card?
+                </Typography>
+                <Typography variant="body2" color="text.secondary" gutterBottom>
+                  Deleting hides the card but keeps its scheduling state and
+                  review history — restore it later from Browse's "Show
+                  deleted" view.
+                </Typography>
+                {!confirmDelete ? (
+                  <Button
+                    variant="outlined"
+                    color="error"
+                    onClick={() => setConfirmDelete(true)}
+                    disabled={deleteBusy}
+                  >
+                    Delete
+                  </Button>
+                ) : (
+                  <Box sx={{ display: 'flex', gap: 1, mt: 1 }}>
+                    <Button onClick={() => setConfirmDelete(false)} disabled={deleteBusy}>
+                      Keep card
+                    </Button>
+                    <Button
+                      variant="contained"
+                      color="error"
+                      onClick={confirmDeleteCard}
+                      disabled={deleteBusy}
+                    >
+                      {deleteBusy ? 'Deleting…' : 'Delete card'}
+                    </Button>
+                  </Box>
+                )}
+                {deleteError && (
+                  <Alert severity="error" sx={{ mt: 2 }}>
+                    {deleteError}
+                  </Alert>
+                )}
               </Box>
             </Box>
           )}
@@ -827,6 +896,23 @@ function ReviewView() {
                   </Typography>
                 )}
               </Typography>
+              {(aiStatus || aiModel) && (
+                <Typography variant="body2" color="text.secondary" sx={{ mb: 1 }} data-testid="ai-meta">
+                  {aiStatus && (
+                    <span data-testid="ai-status">Status: {aiStatus}</span>
+                  )}
+                  {aiStatus && aiModel && ' · '}
+                  {aiModel && (
+                    <span data-testid="ai-model">Model: {aiModel}</span>
+                  )}
+                </Typography>
+              )}
+              {aiStarted && (
+                <Typography variant="body2" color="text.secondary" sx={{ mb: 1 }} data-testid="ai-selection">
+                  {aiMode === 'split' ? 'Split this card' : 'Ask a question about this card'}
+                  {aiMode === 'custom' && aiQuestion.trim() && `: “${aiQuestion.trim()}”`}
+                </Typography>
+              )}
               {!aiStarted && (
                 <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
                   <RadioGroup
@@ -845,15 +931,16 @@ function ReviewView() {
                       label="Ask a question about this card"
                     />
                   </RadioGroup>
-                  <TextField
-                    label="Your question"
-                    placeholder="is this card still valid?"
-                    multiline
-                    minRows={2}
-                    value={aiQuestion}
-                    onChange={(e) => setAiQuestion(e.target.value)}
-                    helperText="Used when “Ask a question about this card” is selected."
-                  />
+                  {aiMode === 'custom' && (
+                    <TextField
+                      label="Your question"
+                      placeholder="is this card still valid?"
+                      multiline
+                      minRows={2}
+                      value={aiQuestion}
+                      onChange={(e) => setAiQuestion(e.target.value)}
+                    />
+                  )}
                   {aiError && (
                     <Alert severity="error" sx={{ mb: 0 }}>
                       {aiError}
@@ -971,11 +1058,15 @@ function BrowseView() {
   const [loading, setLoading] = useState(false);
   const [q, setQ] = useState('');
   const [committedQ, setCommittedQ] = useState('');
+  const [showDeleted, setShowDeleted] = useState(false);
+  const [rowBusy, setRowBusy] = useState<string | null>(null);
+  const [rowError, setRowError] = useState<string | null>(null);
   const sentinelRef = useRef<HTMLDivElement | null>(null);
-  const stateRef = useRef({ deckId, q: '', loading: false, total: Infinity as number });
+  const stateRef = useRef({ deckId, q: '', showDeleted: false, loading: false, total: Infinity as number });
   stateRef.current = {
     deckId,
     q: committedQ,
+    showDeleted,
     loading,
     total: rows.length >= total && total > 0 ? total : (Number.isFinite(stateRef.current.total) ? stateRef.current.total : Infinity),
   };
@@ -1001,7 +1092,8 @@ function BrowseView() {
     if (!deckId) return;
     let cancelled = false;
     setLoading(true);
-    browseCards(deckId, 'due', 'asc', 0, BROWSE_PAGE, committedQ)
+    setRowError(null);
+    browseCards(deckId, 'due', 'asc', 0, BROWSE_PAGE, committedQ, showDeleted)
       .then(({ cards, total: t }) => {
         if (cancelled) return;
         setRows(cards);
@@ -1020,7 +1112,49 @@ function BrowseView() {
     return () => {
       cancelled = true;
     };
-  }, [deckId, committedQ]);
+  }, [deckId, committedQ, showDeleted]);
+
+  const reloadBrowse = useCallback(async () => {
+    if (!deckId) return;
+    setLoading(true);
+    setRowError(null);
+    try {
+      const { cards, total: t } = await browseCards(
+        deckId, 'due', 'asc', 0, BROWSE_PAGE, committedQ, showDeleted,
+      );
+      setRows(cards);
+      setTotal(t);
+    } finally {
+      setLoading(false);
+    }
+  }, [deckId, committedQ, showDeleted]);
+
+  const handleRestore = async (cardId: string) => {
+    setRowError(null);
+    setRowBusy(cardId);
+    try {
+      await restoreCard(cardId);
+      await reloadBrowse();
+    } catch (e) {
+      setRowError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setRowBusy(null);
+    }
+  };
+
+  const handlePermanentDelete = async (cardId: string) => {
+    if (!window.confirm('Permanently delete this card? Its schedule and review history are removed too. This cannot be undone.')) return;
+    setRowError(null);
+    setRowBusy(cardId);
+    try {
+      await deleteCard(cardId, true);
+      await reloadBrowse();
+    } catch (e) {
+      setRowError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setRowBusy(null);
+    }
+  };
 
   // Infinite scroll: load the next page when the sentinel appears.
   useEffect(() => {
@@ -1042,6 +1176,7 @@ function BrowseView() {
           rows.length,
           BROWSE_PAGE,
           s.q,
+          s.showDeleted,
         );
         if (stopped) return;
         setRows((prev) => [...prev, ...cards]);
@@ -1081,7 +1216,7 @@ function BrowseView() {
   // filter the already-loaded rows instantly; the debounced server
   // search then replaces them with full database results.
   const searching = q.trim() !== committedQ;
-  const visibleRows =
+  const searchedRows =
     searching && q.trim()
       ? rows.filter((r) =>
           r.front_text.toLowerCase().includes(q.trim().toLowerCase()),
@@ -1089,8 +1224,13 @@ function BrowseView() {
       : rows;
 
   // Green divider between due-today rows (top) and everything else.
-  // The table is always due-date ascending, so due-today rows lead.
-  const splitIdx = visibleRows.findIndex((r) => !r.due_today);
+  // Due-today rows are ordered first: the server sort is by due date, so
+  // not-yet-due new cards (reps 0) can otherwise sit above due-today rows
+  // and hide the divider.
+  const visibleRows = showDeleted
+    ? searchedRows
+    : [...searchedRows].sort((a, b) => Number(b.due_today) - Number(a.due_today));
+  const splitIdx = showDeleted ? -1 : visibleRows.findIndex((r) => !r.due_today);
 
   return (
     <Box>
@@ -1124,6 +1264,26 @@ function BrowseView() {
           },
         }}
       />
+      <FormControlLabel
+        control={
+          <Checkbox
+            checked={showDeleted}
+            onChange={(e) => setShowDeleted(e.target.checked)}
+          />
+        }
+        label="Show deleted"
+      />
+      {showDeleted && (
+        <Typography variant="body2" color="text.secondary" sx={{ mb: 1 }}>
+          Deleted cards only — restore one, or permanently delete it (schedule
+          and review history are removed only by permanent deletion).
+        </Typography>
+      )}
+      {rowError && (
+        <Alert severity="error" sx={{ mb: 1 }}>
+          {rowError}
+        </Alert>
+      )}
       <TableContainer sx={{ overflowX: 'hidden' }}>
         <Table size="small" sx={{ tableLayout: 'fixed', width: '100%' }}>
           <TableHead>
@@ -1134,6 +1294,9 @@ function BrowseView() {
               <TableCell sx={{ width: '8.5rem', fontWeight: 'bold' }}>
                 Last reviewed
               </TableCell>
+              {showDeleted && (
+                <TableCell sx={{ width: '12rem', fontWeight: 'bold' }}>Actions</TableCell>
+              )}
             </TableRow>
           </TableHead>
           <TableBody>
@@ -1141,11 +1304,12 @@ function BrowseView() {
               <Fragment key={r.card_id}>
                 {i === splitIdx && splitIdx > 0 && (
                   <TableRow data-testid="due-divider">
-                    <TableCell colSpan={4} sx={{ p: 0, borderBottom: 'none' }}>
+                    <TableCell colSpan={4} sx={{ p: 0, borderBottom: 'none', height: '3px' }}>
                       <Box
                         sx={{
                           borderTop: '3px solid',
                           borderColor: 'success.main',
+                          minHeight: '3px',
                         }}
                       />
                     </TableCell>
@@ -1158,6 +1322,29 @@ function BrowseView() {
                   </TableCell>
                   <TableCell>{fmtDate(r.due)}</TableCell>
                   <TableCell>{fmtDate(r.last_review)}</TableCell>
+                  {showDeleted && (
+                    <TableCell>
+                      <Box sx={{ display: 'flex', gap: 1, flexWrap: 'wrap' }}>
+                        <Button
+                          size="small"
+                          variant="outlined"
+                          onClick={() => handleRestore(r.card_id)}
+                          disabled={rowBusy === r.card_id}
+                        >
+                          Restore
+                        </Button>
+                        <Button
+                          size="small"
+                          variant="outlined"
+                          color="error"
+                          onClick={() => handlePermanentDelete(r.card_id)}
+                          disabled={rowBusy === r.card_id}
+                        >
+                          Delete forever
+                        </Button>
+                      </Box>
+                    </TableCell>
+                  )}
                 </TableRow>
               </Fragment>
             ))}

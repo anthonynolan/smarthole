@@ -502,7 +502,10 @@ def test_stats(client, tmp_path):
     assert stats["today"]["studied"] == 1
     assert stats["today"]["new"] == 1
     assert stats["today"]["accuracy"] == 100.0
-    assert stats["forecast"][0]["due"] == 2  # graded + learning card, both due today
+    # Single wave per day: the graded card is due tomorrow, while the
+    # untouched learning card is still due today.
+    assert stats["forecast"][0]["due"] == 1
+    assert stats["forecast"][1]["due"] == 1
     assert sum(f["due"] for f in stats["forecast"]) == 2
 
 

@@ -58,6 +58,18 @@ all apps: every deploy healthchecks Grimoire and Tracker too.
 
 ## Deploying
 
+Deploys run from GitHub Actions (`.github/workflows/deploy.yml`): every push
+to `master` — or a manual **Run workflow** dispatch — runs the gates and then
+`scripts/deploy_lightsail.sh` on the runner. Required repository secrets:
+
+- `LIGHTSAIL_SSH_KEY` — contents of `~/.ssh/LightsailDefaultKey-eu-west-1.pem`
+- `PROD_ENV_FILE` — contents of `.env.prod` (production env for the server)
+
+The workflow writes both secrets to the paths the script already expects
+(the key to `~/.ssh/LightsailDefaultKey-eu-west-1.pem`, the env to
+`.env.prod`) and adds the server's host key, so the script itself is
+unchanged. Local fallback still works:
+
 ```bash
 bash scripts/deploy_lightsail.sh   # from the repo root
 ```

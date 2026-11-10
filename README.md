@@ -4,6 +4,46 @@ Personal hosted Anki reviewer. Import `.apkg` exports, review on an FSRS
 spaced-repetition schedule. FastAPI + MongoDB Atlas (same cluster as grimoire,
 separate database) + py-fsrs.
 
+## Features
+
+- Sign in with Google, or register / log in with email + password.
+- Import `.apkg` deck exports and full `.colpkg` collection backups
+  (modern 23.10+ and legacy formats), with live streamed progress
+  (cards read, then cards saved); Anki scheduling is kept when the file
+  includes it (re-import to refresh).
+- Review due cards with Again / Hard / Good / Easy; each grade button
+  previews the next-due interval, and the review screen shows how many
+  cards are due today.
+- FSRS scheduling (`desired_retention=0.9`, learning steps 1m/10m, 10m
+  relearning, fuzzing on) with a single wave of due cards per day — a card
+  graded today never comes due again until tomorrow.
+- Anki-style daily limit of 20 new cards per day, in Anki new-order
+  (tune with `NEW_CARDS_PER_DAY`).
+- Add cards, and edit cards with formatting preserved: line breaks survive
+  the round trip, and a small markdown subset (`**bold**`, `*italic*`,
+  `` `code` ``, `[links](https://…)`) renders on the card.
+- The edit screen shows all metadata for the card (IDs, deck, creation
+  date, due / last review, FSRS state, step, stability, difficulty, reps,
+  lapses, Anki note/ord/GUID, suspension and deletion flags) for data and
+  system troubleshooting.
+- Deletion is logical by default: deleted cards are hidden everywhere but
+  keep their scheduling state and review history. Deleting happens from
+  inside the edit screen.
+- Browse the deck with search; a green line separates cards due today
+  from the rest. A "Show deleted" toggle lists only deleted cards, where
+  each row offers Restore or permanent Delete forever (only permanent
+  deletion removes the schedule and review history).
+- AI review of a card: split it into single-fact cards, or ask a question
+  about it (the question box only appears for that option). The chosen
+  option and question stay visible while the call runs; live statuses
+  (`sent`, `awaiting response`, `streaming`, `finished`) and the model
+  name are shown.
+- Stats: due/new/learning/reviewed-today counts, today's accuracy, and a
+  30-day due forecast. Dates render unambiguously as `12-Nov'26`.
+- Deploy via GitHub Actions on every push to `master` (see
+  [docs/deploy.md](docs/deploy.md)); the local
+  `scripts/deploy_lightsail.sh` remains as a fallback.
+
 ## Setup
 
 ```bash
@@ -53,6 +93,8 @@ cd smarthole-client && npm run dev   # proxied /api -> localhost:8123
 
 Grades drive the FSRS scheduler (`fsrs` package, default parameters,
 `desired_retention=0.9`, learning steps 1m/10m, 10m relearning, fuzzing on).
+Intraday steps are clamped to the start of the next day, so there is only
+ever one wave of due cards per day.
 
 Imports keep your Anki schedule when the file has one: review intervals stand
 in for stability, ease maps to difficulty, and due dates anchor on your last

@@ -69,6 +69,8 @@ class Card(Document):
     suspended = BooleanField(default=False)
     new_position = IntField(default=0)  # Anki new-queue order
     created_at = DateTimeField(default=utcnow)
+    deleted = BooleanField(default=False)  # logical delete; hard delete purges
+    deleted_at = DateTimeField()
 
 
 class CardState(Document):

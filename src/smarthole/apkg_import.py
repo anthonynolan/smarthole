@@ -104,6 +104,82 @@ def sanitize(html: str) -> str:
     return bleach.clean(html, tags=ALLOWED_TAGS, attributes=ALLOWED_ATTRS, strip=True)
 
 
+def html_to_text(html: str) -> str:
+    """Card HTML back to editable plain text, preserving line breaks.
+
+    Block ends (paragraphs, divs, list items, table rows, headings, <br>,
+    <hr>) become newlines so a card edited in a textarea round-trips
+    without losing its line breaks.
+    """
+    import html as html_module
+    from html.parser import HTMLParser
+
+    BLOCKS = {"p", "div", "li", "tr", "hr", "h1", "h2", "h3", "h4", "ul", "ol"}
+
+    class _Text(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.parts: list[str] = []
+
+        def handle_starttag(self, tag: str, attrs):
+            if tag == "br":
+                self.parts.append("\n")
+
+        def handle_data(self, data: str):
+            self.parts.append(data)
+
+        def handle_endtag(self, tag: str):
+            if tag in BLOCKS:
+                self.parts.append("\n")
+
+    parser = _Text()
+    parser.feed(html or "")
+    text = html_module.unescape("".join(parser.parts))
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    text = re.sub(r"\n[ \t]+", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def _markdown_text_segment(segment: str) -> str:
+    """Escape one tag-free text segment, then apply inline markdown."""
+    import html as html_module
+
+    escaped = html_module.escape(segment, quote=False)
+    # Inline code first so its contents are not treated as markdown.
+    codes: list[str] = []
+
+    def _code(m: re.Match) -> str:
+        codes.append(f"<code>{m.group(1)}</code>")
+        return f"\ue000{len(codes) - 1}\ue001"
+
+    escaped = re.sub(r"`([^`\n]+)`", _code, escaped)
+    escaped = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", escaped)
+    escaped = re.sub(r"(^|[\s>(])\*([^*\n]+)\*", r"\1<em>\2</em>", escaped)
+    escaped = re.sub(
+        r"\[([^\]\n]+)\]\((https?://[^)\s]+)\)", r'<a href="\2">\1</a>', escaped
+    )
+    for i, code in enumerate(codes):
+        escaped = escaped.replace(f"\ue000{i}\ue001", code)
+    return escaped.replace("\n", "<br>")
+
+
+def render_plain_text(text: str) -> str:
+    """User-typed card text (add/edit forms) to safe display HTML.
+
+    Real HTML tags pass through (then the usual sanitize pass); text
+    between tags is escaped, keeps newlines as ``<br>``, and supports a
+    small markdown subset: **bold**, *italic*, `code`, [links](url).
+    Imported Anki HTML keeps going through :func:`sanitize` directly.
+    """
+    parts = re.split(r"(<[^>]*>)", text or "")
+    rendered = [
+        part if (part.startswith("<") and part.endswith(">")) else _markdown_text_segment(part)
+        for part in parts
+    ]
+    return sanitize("".join(rendered))
+
+
 def rewrite_media_refs(html: str, filename_to_url: dict[str, str]) -> str:
     for filename, url in filename_to_url.items():
         html = html.replace(f'src="{filename}"', f'src="{url}"')

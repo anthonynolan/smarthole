@@ -276,7 +276,7 @@ def test_ai_review_stream_custom_returns_answer(client, monkeypatch):
     assert final["answer"] == "Yes, still valid."
 
 
-def test_delete_removes_card_state_and_reviews(client):
+def test_delete_is_logical_by_default(client):
     from smarthole.models import Review
 
     register(client)
@@ -287,7 +287,15 @@ def test_delete_removes_card_state_and_reviews(client):
     client.post(f"/api/review/{card_id}", json={"rating": 3})
     assert Review.objects(card=card).count() == 1
 
+    # Plain DELETE only flags the card: schedule and reviews survive.
     res = client.delete(f"/api/cards/{card_id}")
+    assert res.status_code == 200, res.text
+    assert Card.objects(id=card_id).first() is not None
+    assert CardState.objects(card=card).count() == 1
+    assert Review.objects(card=card).count() == 1
+
+    # Only permanent deletion purges the card, its state, and its reviews.
+    res = client.delete(f"/api/cards/{card_id}?permanent=true")
     assert res.status_code == 200, res.text
     assert Card.objects(id=card_id).first() is None
     assert CardState.objects(card=card).count() == 0

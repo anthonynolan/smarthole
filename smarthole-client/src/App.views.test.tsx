@@ -1,6 +1,14 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
-import { vi } from 'vitest';
+import { expect, test, vi } from 'vitest';
 import App from './App';
+import { htmlToText } from './api';
+
+test('htmlToText preserves block line breaks for the edit round-trip', () => {
+  expect(htmlToText('Line one<br>Line two')).toBe('Line one\nLine two');
+  expect(htmlToText('<p>Para one</p><p>Para two</p>')).toBe('Para one\nPara two');
+  expect(htmlToText('<ul><li>a</li><li>b</li></ul>')).toBe('a\nb');
+  expect(htmlToText('Q<hr>A')).toBe('Q\nA');
+});
 
 function mockApi() {
   vi.stubGlobal(
@@ -388,14 +396,23 @@ test('AI review dialog reports when no change is needed', async () => {
     expect(screen.getByRole('button', { name: 'AI review' })).toBeTruthy(),
   );
   fireEvent.click(screen.getByRole('button', { name: 'AI review' }));
-  // Options come first: split is offered plus a free-text question box.
+  // Options come first: split is offered; the question box only appears
+  // for the ask-a-question option.
   await waitFor(() => expect(screen.getByText('Split this card')).toBeTruthy());
-  expect(screen.getByLabelText('Your question')).toBeTruthy();
+  expect(screen.queryByLabelText('Your question')).toBeNull();
+  fireEvent.click(screen.getByText('Ask a question about this card'));
+  await waitFor(() => expect(screen.getByLabelText('Your question')).toBeTruthy());
+  fireEvent.click(screen.getByText('Split this card'));
+  await waitFor(() => expect(screen.queryByLabelText('Your question')).toBeNull());
   fireEvent.click(screen.getByRole('button', { name: 'Ask AI' }));
   await waitFor(() =>
     expect(screen.getByText(/No changes suggested/)).toBeTruthy(),
   );
   expect(screen.getByText(/took \d+\.\ds/)).toBeTruthy();
+  // The chosen option stays visible and the model is shown.
+  expect(screen.getByTestId('ai-selection')).toHaveTextContent('Split this card');
+  expect(screen.getByTestId('ai-model')).toHaveTextContent('Model: m');
+  expect(screen.getByTestId('ai-status')).toHaveTextContent('finished');
   vi.unstubAllGlobals();
 });
 
@@ -598,6 +615,12 @@ test('review view deletes the card after confirmation', async () => {
   vi.stubGlobal('fetch', counting);
   render(<App />);
   await waitFor(() =>
+    expect(screen.getByRole('button', { name: 'Edit' })).toBeTruthy(),
+  );
+  // Delete lives inside the edit panel: no standalone Delete button.
+  expect(screen.queryByRole('button', { name: 'Delete' })).toBeNull();
+  fireEvent.click(screen.getByRole('button', { name: 'Edit' }));
+  await waitFor(() =>
     expect(screen.getByRole('button', { name: 'Delete' })).toBeTruthy(),
   );
   fireEvent.click(screen.getByRole('button', { name: 'Delete' }));
@@ -668,6 +691,141 @@ test('import shows streamed progress then the result', async () => {
   );
   await waitFor(() =>
     expect(screen.getByText(/2 cards imported, 2 due now/)).toBeTruthy(),
+  );
+  vi.unstubAllGlobals();
+});
+
+test('edit panel shows full card metadata for troubleshooting', async () => {
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (url: any, init?: any) => {
+      const u = String(url);
+      const body = (v: any) => ({ ok: true, json: () => Promise.resolve(v) });
+      if (u === '/api/config') return body({ googleClientId: null });
+      if (u === '/api/me') return body({ email: 't@example.com' });
+      if (u === '/api/decks')
+        return body({
+          decks: [{ id: 'd1', name: 'Test', total: 10, due: 3, due_today: 5, new: 2 }],
+        });
+      if (u.startsWith('/api/next'))
+        return body({
+          cards: [
+            {
+              card_id: 'c1',
+              deck_id: 'd1',
+              deck_name: 'Test',
+              front_html: 'Q',
+              back_html: 'A',
+              due: '2026-11-08',
+              state: 2,
+              reps: 3,
+              created_at: '2026-10-01T00:00:00+00:00',
+              meta: {
+                card_id: 'c1',
+                deck_id: 'd1',
+                deck_name: 'Test',
+                created_at: '2026-10-01T00:00:00+00:00',
+                suspended: false,
+                deleted: false,
+                deleted_at: null,
+                new_position: 7,
+                anki_nid: 11,
+                anki_ord: 0,
+                anki_guid: 'guid-1',
+                due: '2026-11-08',
+                last_review: '2026-11-07',
+                state: 2,
+                step: 0,
+                stability: 5.5,
+                difficulty: 4.2,
+                reps: 3,
+                lapses: 1,
+                introduced_at: '2026-10-02T00:00:00+00:00',
+              },
+            },
+          ],
+        });
+      throw new Error(`unexpected fetch ${u} ${init?.method ?? 'GET'}`);
+    }),
+  );
+  render(<App />);
+  await waitFor(() =>
+    expect(screen.getByRole('button', { name: 'Edit' })).toBeTruthy(),
+  );
+  fireEvent.click(screen.getByRole('button', { name: 'Edit' }));
+  await waitFor(() => expect(screen.getByTestId('card-metadata')).toBeTruthy());
+  const meta = screen.getByTestId('card-metadata');
+  expect(meta).toHaveTextContent('Card ID');
+  expect(meta).toHaveTextContent('guid-1');
+  expect(meta).toHaveTextContent('Stability');
+  expect(meta).toHaveTextContent('5.5');
+  expect(meta).toHaveTextContent('Lapses');
+  vi.unstubAllGlobals();
+});
+
+test('browse show-deleted lists only deleted cards with restore', async () => {
+  const live = {
+    card_id: 'c1',
+    front_text: 'Live Q',
+    due: '2026-11-08',
+    last_review: null,
+    state: 2,
+    reps: 1,
+    suspended: false,
+    due_today: true,
+  };
+  const gone = {
+    card_id: 'c9',
+    front_text: 'Gone Q',
+    due: '2026-11-08',
+    last_review: null,
+    state: 2,
+    reps: 1,
+    suspended: false,
+    deleted: true,
+    due_today: false,
+  };
+  const fetchMock = vi.fn(async (url: any, init?: any) => {
+    const u = String(url);
+    const body = (v: any) => ({ ok: true, json: () => Promise.resolve(v) });
+    if (u === '/api/config') return body({ googleClientId: null });
+    if (u === '/api/me') return body({ email: 't@example.com' });
+    if (u === '/api/decks')
+      return body({
+        decks: [{ id: 'd1', name: 'Test', total: 10, due: 3, due_today: 5, new: 2 }],
+      });
+    if (u.startsWith('/api/next')) return body({ cards: [] });
+    if (u.startsWith('/api/decks/d1/cards')) {
+      const deletedOnly = u.includes('show_deleted=true');
+      const cards = deletedOnly ? [gone] : [live];
+      return body({ cards, total: cards.length });
+    }
+    if (u === '/api/cards/c9/restore' && init?.method === 'POST')
+      return body({ restored: 'c9' });
+    throw new Error(`unexpected fetch ${u} ${init?.method ?? 'GET'}`);
+  });
+  vi.stubGlobal('fetch', fetchMock);
+  render(<App />);
+  await waitFor(() => expect(screen.getByLabelText('menu')).toBeTruthy());
+  fireEvent.click(screen.getByLabelText('menu'));
+  fireEvent.click(screen.getAllByText('Browse')[0]);
+  await waitFor(() => expect(screen.getByText('Live Q')).toBeTruthy());
+  expect(screen.queryByText('Gone Q')).toBeNull();
+  // Toggle to deleted-only: live cards disappear, restore actions appear.
+  fireEvent.click(screen.getByText('Show deleted'));
+  await waitFor(() => expect(screen.getByText('Gone Q')).toBeTruthy());
+  expect(screen.queryByText('Live Q')).toBeNull();
+  expect(screen.getByRole('button', { name: 'Restore' })).toBeTruthy();
+  expect(screen.getByRole('button', { name: 'Delete forever' })).toBeTruthy();
+  // The due-today divider is hidden in deleted-only mode.
+  expect(screen.queryByTestId('due-divider')).toBeNull();
+  fireEvent.click(screen.getByRole('button', { name: 'Restore' }));
+  await waitFor(() =>
+    expect(
+      fetchMock.mock.calls.some(
+        ([u, init]) => String(u) === '/api/cards/c9/restore' && init?.method === 'POST',
+      ),
+    ).toBe(true),
   );
   vi.unstubAllGlobals();
 });

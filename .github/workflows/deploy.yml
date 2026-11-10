@@ -1,0 +1,58 @@
+# Deploy smarthole to the shared Lightsail instance.
+#
+# Replaces launching scripts/deploy_lightsail.sh from a laptop: the same
+# script runs here on every push to master (or manually via workflow_dispatch).
+# Required repository secrets:
+#   LIGHTSAIL_SSH_KEY  - contents of ~/.ssh/LightsailDefaultKey-eu-west-1.pem
+#   PROD_ENV_FILE      - contents of .env.prod (production env for the server)
+# The script's own gates (uv lock check, pytest, frontend build) still run,
+# now inside this job instead of on a laptop.
+
+name: Deploy
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+concurrency:
+  group: smarthole-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up uv + Python
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: smarthole-client/package-lock.json
+
+      - name: Write deploy credentials from secrets
+        env:
+          LIGHTSAIL_SSH_KEY: ${{ secrets.LIGHTSAIL_SSH_KEY }}
+          PROD_ENV_FILE: ${{ secrets.PROD_ENV_FILE }}
+        run: |
+          set -euo pipefail
+          test -n "${LIGHTSAIL_SSH_KEY:-}" || { echo "missing secret LIGHTSAIL_SSH_KEY" >&2; exit 1; }
+          test -n "${PROD_ENV_FILE:-}" || { echo "missing secret PROD_ENV_FILE" >&2; exit 1; }
+          mkdir -p "$HOME/.ssh"
+          chmod 700 "$HOME/.ssh"
+          printf '%s\n' "$LIGHTSAIL_SSH_KEY" > "$HOME/.ssh/LightsailDefaultKey-eu-west-1.pem"
+          chmod 600 "$HOME/.ssh/LightsailDefaultKey-eu-west-1.pem"
+          printf '%s\n' "$PROD_ENV_FILE" > .env.prod
+          chmod 600 .env.prod
+          DEPLOY_HOST="$(grep -oP '^DEPLOY_HOST=\K.*' scripts/deploy_lightsail.sh)"
+          ssh-keyscan -H "$DEPLOY_HOST" >> "$HOME/.ssh/known_hosts"
+
+      - name: Deploy via scripts/deploy_lightsail.sh
+        run: bash scripts/deploy_lightsail.sh
