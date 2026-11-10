@@ -336,6 +336,19 @@ test('review edit flow updates the card', async () => {
   vi.unstubAllGlobals();
 });
 
+function ndjsonResponse(lines: string[]): Response {
+  const enc = new TextEncoder();
+  const stream = new ReadableStream({
+    start(c) {
+      for (const line of lines) c.enqueue(enc.encode(line + '\n'));
+      c.close();
+    },
+  });
+  return new Response(stream, {
+    headers: { 'content-type': 'application/x-ndjson' },
+  });
+}
+
 test('AI review dialog reports when no change is needed', async () => {
   vi.stubGlobal(
     'fetch',
@@ -362,8 +375,11 @@ test('AI review dialog reports when no change is needed', async () => {
             },
           ],
         });
-      if (u === '/api/cards/c1/ai-review' && init?.method === 'POST')
-        return body({ suggestions: [], model: 'muse-spark-1.3-contributor' });
+      if (u.startsWith('/api/cards/c1/ai-review/stream'))
+        return ndjsonResponse([
+          JSON.stringify({ delta: '{"cards": []}' }),
+          JSON.stringify({ done: true, suggestions: [], model: 'm' }),
+        ]);
       throw new Error(`unexpected fetch ${u} ${init?.method ?? 'GET'}`);
     }),
   );
@@ -372,10 +388,231 @@ test('AI review dialog reports when no change is needed', async () => {
     expect(screen.getByRole('button', { name: 'AI review' })).toBeTruthy(),
   );
   fireEvent.click(screen.getByRole('button', { name: 'AI review' }));
+  // Options come first: split is offered plus a free-text question box.
+  await waitFor(() => expect(screen.getByText('Split this card')).toBeTruthy());
+  expect(screen.getByLabelText('Your question')).toBeTruthy();
+  fireEvent.click(screen.getByRole('button', { name: 'Ask AI' }));
   await waitFor(() =>
     expect(screen.getByText(/No changes suggested/)).toBeTruthy(),
   );
   expect(screen.getByText(/took \d+\.\ds/)).toBeTruthy();
+  vi.unstubAllGlobals();
+});
+
+test('AI review streams the output as it arrives', async () => {
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (url: any, init?: any) => {
+      const u = String(url);
+      const body = (v: any) => ({ ok: true, json: () => Promise.resolve(v) });
+      if (u === '/api/config') return body({ googleClientId: null });
+      if (u === '/api/me') return body({ email: 't@example.com' });
+      if (u === '/api/decks')
+        return body({
+          decks: [{ id: 'd1', name: 'Test', total: 10, due: 3, due_today: 5, new: 2 }],
+        });
+      if (u.startsWith('/api/next'))
+        return body({
+          cards: [
+            {
+              card_id: 'c1',
+              deck_id: 'd1',
+              front_html: 'Q',
+              back_html: 'A',
+              due: '2026-11-08',
+              state: 2,
+              reps: 1,
+            },
+          ],
+        });
+      if (u.startsWith('/api/cards/c1/ai-review/stream')) {
+        const enc = new TextEncoder();
+        const stream = new ReadableStream({
+          start(c) {
+            c.enqueue(enc.encode(JSON.stringify({ delta: '{"cards":' }) + '\n'));
+            setTimeout(() => {
+              c.enqueue(
+                enc.encode(
+                  JSON.stringify({ delta: ' []}' }) +
+                    '\n' +
+                    JSON.stringify({ done: true, suggestions: [], model: 'm' }) +
+                    '\n',
+                ),
+              );
+              c.close();
+            }, 50);
+          },
+        });
+        return new Response(stream, {
+          headers: { 'content-type': 'application/x-ndjson' },
+        });
+      }
+      throw new Error(`unexpected fetch ${u} ${init?.method ?? 'GET'}`);
+    }),
+  );
+  render(<App />);
+  await waitFor(() =>
+    expect(screen.getByRole('button', { name: 'AI review' })).toBeTruthy(),
+  );
+  fireEvent.click(screen.getByRole('button', { name: 'AI review' }));
+  await waitFor(() => expect(screen.getByRole('button', { name: 'Ask AI' })).toBeTruthy());
+  fireEvent.click(screen.getByRole('button', { name: 'Ask AI' }));
+  // The partial output is visible before the stream completes.
+  await waitFor(() => expect(screen.getByTestId('ai-stream')).toBeTruthy());
+  await waitFor(() =>
+    expect(screen.getByText(/No changes suggested/)).toBeTruthy(),
+  );
+  vi.unstubAllGlobals();
+});
+
+test('AI review answers a custom question about the card', async () => {
+  const fetchMock = vi.fn(async (url: any, init?: any) => {
+    const u = String(url);
+    const body = (v: any) => ({ ok: true, json: () => Promise.resolve(v) });
+    if (u === '/api/config') return body({ googleClientId: null });
+    if (u === '/api/me') return body({ email: 't@example.com' });
+    if (u === '/api/decks')
+      return body({
+        decks: [{ id: 'd1', name: 'Test', total: 10, due: 3, due_today: 5, new: 2 }],
+      });
+    if (u.startsWith('/api/next'))
+      return body({
+        cards: [
+          {
+            card_id: 'c1',
+            deck_id: 'd1',
+            front_html: 'Q',
+            back_html: 'A',
+            due: '2026-11-08',
+            state: 2,
+            reps: 1,
+          },
+        ],
+      });
+    if (u.startsWith('/api/cards/c1/ai-review/stream'))
+      return ndjsonResponse([
+        JSON.stringify({ delta: 'Yes, still valid.' }),
+        JSON.stringify({ done: true, answer: 'Yes, still valid.', model: 'm' }),
+      ]);
+    throw new Error(`unexpected fetch ${u} ${init?.method ?? 'GET'}`);
+  });
+  vi.stubGlobal('fetch', fetchMock);
+  render(<App />);
+  await waitFor(() =>
+    expect(screen.getByRole('button', { name: 'AI review' })).toBeTruthy(),
+  );
+  fireEvent.click(screen.getByRole('button', { name: 'AI review' }));
+  await waitFor(() =>
+    expect(screen.getByText('Ask a question about this card')).toBeTruthy(),
+  );
+  fireEvent.click(screen.getByText('Ask a question about this card'));
+  fireEvent.change(screen.getByLabelText('Your question'), {
+    target: { value: 'is this card still valid?' },
+  });
+  fireEvent.click(screen.getByRole('button', { name: 'Ask AI' }));
+  await waitFor(() => expect(screen.getByTestId('ai-answer')).toBeTruthy());
+  expect(screen.getByTestId('ai-answer')).toHaveTextContent('Yes, still valid.');
+  expect(
+    fetchMock.mock.calls.some(([u]) =>
+      String(u).includes('question=is%20this%20card%20still%20valid%3F'),
+    ),
+  ).toBe(true);
+  vi.unstubAllGlobals();
+});
+
+test('review view shows the card creation date', async () => {
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (url: any) => {
+      const u = String(url);
+      const body = (v: any) => ({ ok: true, json: () => Promise.resolve(v) });
+      if (u === '/api/config') return body({ googleClientId: null });
+      if (u === '/api/me') return body({ email: 't@example.com' });
+      if (u === '/api/decks')
+        return body({
+          decks: [{ id: 'd1', name: 'Test', total: 10, due: 3, due_today: 5, new: 2 }],
+        });
+      if (u.startsWith('/api/next'))
+        return body({
+          cards: [
+            {
+              card_id: 'c1',
+              deck_id: 'd1',
+              front_html: 'Q',
+              back_html: 'A',
+              due: '2026-11-08',
+              state: 2,
+              reps: 1,
+              created_at: '2026-10-01T00:00:00+00:00',
+            },
+          ],
+        });
+      throw new Error(`unexpected fetch ${u}`);
+    }),
+  );
+  render(<App />);
+  await waitFor(() => expect(screen.getByText(/Created 1-Oct'26/)).toBeTruthy());
+  vi.unstubAllGlobals();
+});
+
+test('review view deletes the card after confirmation', async () => {
+  const fetchMock = vi.fn(async (url: any, init?: any) => {
+    const u = String(url);
+    const body = (v: any) => ({ ok: true, json: () => Promise.resolve(v) });
+    if (u === '/api/config') return body({ googleClientId: null });
+    if (u === '/api/me') return body({ email: 't@example.com' });
+    if (u === '/api/decks')
+      return body({
+        decks: [{ id: 'd1', name: 'Test', total: 1, due: 1, due_today: 1, new: 0 }],
+      });
+    if (u.startsWith('/api/next')) return body({ cards: [] });
+    if (u === '/api/cards/c1' && init?.method === 'DELETE')
+      return body({ deleted: 'c1' });
+    throw new Error(`unexpected fetch ${u} ${init?.method ?? 'GET'}`);
+  });
+  // First /api/next call returns the card; later calls return nothing.
+  let nextCalls = 0;
+  const counting = vi.fn(async (url: any, init?: any) => {
+    const u = String(url);
+    if (u.startsWith('/api/next') && nextCalls++ === 0) {
+      return {
+        ok: true,
+        json: () =>
+          Promise.resolve({
+            cards: [
+              {
+                card_id: 'c1',
+                deck_id: 'd1',
+                front_html: 'Q',
+                back_html: 'A',
+                due: '2026-11-08',
+                state: 2,
+                reps: 1,
+              },
+            ],
+          }),
+      };
+    }
+    return fetchMock(url, init);
+  });
+  vi.stubGlobal('fetch', counting);
+  render(<App />);
+  await waitFor(() =>
+    expect(screen.getByRole('button', { name: 'Delete' })).toBeTruthy(),
+  );
+  fireEvent.click(screen.getByRole('button', { name: 'Delete' }));
+  await waitFor(() => expect(screen.getByText('Delete this card?')).toBeTruthy());
+  fireEvent.click(screen.getByRole('button', { name: 'Delete card' }));
+  await waitFor(() =>
+    expect(
+      counting.mock.calls.some(
+        ([u, init]) => String(u) === '/api/cards/c1' && init?.method === 'DELETE',
+      ),
+    ).toBe(true),
+  );
+  await waitFor(() =>
+    expect(screen.getByText('Nothing due — nice work.')).toBeTruthy(),
+  );
   vi.unstubAllGlobals();
 });
 

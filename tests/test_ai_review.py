@@ -179,6 +179,103 @@ def test_update_card_requires_login_and_ownership(client):
     )
 
 
+def test_next_includes_card_created_at(client):
+    register(client)
+    card_id, _ = make_card(client)
+    card = Card.objects(id=card_id).first()
+    assert card.created_at is not None
+    nxt = client.get("/api/next").json()["cards"]
+    assert len(nxt) == 1
+    assert nxt[0]["created_at"] == card.created_at.isoformat()
+
+
+def test_ai_review_custom_question_returns_answer(client, monkeypatch):
+    register(client)
+    card_id, _ = make_card(client)
+
+    def fake(front_html, back_html, question):
+        assert "Q front" in front_html
+        assert question == "is this card still valid?"
+        return "Yes — it still tests one fact clearly.", "muse-spark-1.3-contributor"
+
+    monkeypatch.setattr(ai_review, "answer_question_with_ai", fake)
+    res = client.post(
+        f"/api/cards/{card_id}/ai-review",
+        json={"mode": "custom", "question": "is this card still valid?"},
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["answer"] == "Yes — it still tests one fact clearly."
+    assert body["model"] == "muse-spark-1.3-contributor"
+
+
+def test_ai_review_custom_requires_question(client):
+    register(client)
+    card_id, _ = make_card(client)
+    res = client.post(
+        f"/api/cards/{card_id}/ai-review", json={"mode": "custom", "question": "  "}
+    )
+    assert res.status_code == 400
+
+
+def test_ai_review_stream_split_streams_deltas(client, monkeypatch):
+    import json as json_module
+
+    register(client)
+    card_id, _ = make_card(client)
+
+    def fake_stream(front_html, back_html, mode="split", question=None, client=None):
+        assert mode == "split"
+        yield '{"cards": [{"front": "Q1",'
+        yield '"back": "A1"}]}'
+
+    monkeypatch.setattr(ai_review, "stream_review_with_ai", fake_stream)
+    with client.stream(
+        "GET", f"/api/cards/{card_id}/ai-review/stream?mode=split"
+    ) as res:
+        assert res.status_code == 200, res.text
+        raw = res.read().decode("utf-8")
+        lines = [
+            json_module.loads(line)
+            for line in raw.strip().splitlines()
+            if line.strip()
+        ]
+    deltas = [ln["delta"] for ln in lines if "delta" in ln]
+    assert "".join(deltas) == '{"cards": [{"front": "Q1","back": "A1"}]}'
+    final = next(ln for ln in lines if ln.get("done"))
+    assert final["suggestions"] == [{"front": "Q1", "back": "A1"}]
+    assert final["model"] == "muse-spark-1.3-contributor"
+
+
+def test_ai_review_stream_custom_returns_answer(client, monkeypatch):
+    import json as json_module
+
+    register(client)
+    card_id, _ = make_card(client)
+
+    def fake_stream(front_html, back_html, mode="split", question=None, client=None):
+        assert mode == "custom"
+        assert question == "is this card still valid?"
+        yield "Yes, "
+        yield "still valid."
+
+    monkeypatch.setattr(ai_review, "stream_review_with_ai", fake_stream)
+    with client.stream(
+        "GET",
+        f"/api/cards/{card_id}/ai-review/stream?mode=custom"
+        "&question=is%20this%20card%20still%20valid%3F",
+    ) as res:
+        assert res.status_code == 200, res.text
+        raw = res.read().decode("utf-8")
+        lines = [
+            json_module.loads(line)
+            for line in raw.strip().splitlines()
+            if line.strip()
+        ]
+    final = next(ln for ln in lines if ln.get("done"))
+    assert final["answer"] == "Yes, still valid."
+
+
 def test_delete_removes_card_state_and_reviews(client):
     from smarthole.models import Review
 

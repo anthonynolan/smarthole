@@ -18,6 +18,8 @@ import {
   ListItemText,
   MenuItem,
   Paper,
+  Radio,
+  RadioGroup,
   Select,
   Table,
   TableBody,
@@ -51,9 +53,10 @@ import {
   login,
   logout,
   register,
-  requestAiReview,
+  requestAiReviewStream,
   updateCard,
   htmlToText,
+  type AiReviewMode,
   type AiSuggestion,
   type BrowseCard,
   type Deck,
@@ -408,12 +411,20 @@ function ReviewView() {
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [aiOpen, setAiOpen] = useState(false);
+  const [aiMode, setAiMode] = useState<AiReviewMode>('split');
+  const [aiQuestion, setAiQuestion] = useState('');
+  const [aiStarted, setAiStarted] = useState(false);
+  const [aiStreamed, setAiStreamed] = useState('');
+  const [aiAnswer, setAiAnswer] = useState<string | null>(null);
   const [aiSuggestions, setAiSuggestions] = useState<AiSuggestion[]>([]);
   const [aiSelected, setAiSelected] = useState<boolean[]>([]);
   const [aiDeleteOriginal, setAiDeleteOriginal] = useState(true);
   const [aiLoading, setAiLoading] = useState(false);
   const [aiApplying, setAiApplying] = useState(false);
   const [aiError, setAiError] = useState<string | null>(null);
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  const [deleteBusy, setDeleteBusy] = useState(false);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
   const [aiMs, setAiMs] = useState<number | null>(null);
   const [aiElapsed, setAiElapsed] = useState(0);
   const [preloaded, setPreloaded] = useState<ReviewCard | null>(null);
@@ -442,10 +453,17 @@ function ReviewView() {
     setEditing(false);
     setEditError(null);
     setAiOpen(false);
+    setAiMode('split');
+    setAiQuestion('');
+    setAiStarted(false);
+    setAiStreamed('');
+    setAiAnswer(null);
     setAiSuggestions([]);
     setAiSelected([]);
     setAiError(null);
     setAiMs(null);
+    setConfirmDelete(false);
+    setDeleteError(null);
     try {
       const cards = await getNext(deck as '');
       const first = cards[0] ?? null;
@@ -494,19 +512,42 @@ function ReviewView() {
     return () => clearInterval(timer);
   }, [aiLoading]);
 
-  const startAiReview = async () => {
+  const openAiReview = () => {
     if (!card || aiLoading) return;
     setAiOpen(true);
+    setAiStarted(false);
+    setAiStreamed('');
+    setAiAnswer(null);
+    setAiError(null);
+    setAiSuggestions([]);
+    setAiSelected([]);
+    setAiMs(null);
+  };
+
+  const runAiReview = async () => {
+    if (!card || aiLoading) return;
+    if (aiMode === 'custom' && !aiQuestion.trim()) {
+      setAiError('Type a question first.');
+      return;
+    }
+    setAiStarted(true);
     setAiLoading(true);
     setAiError(null);
+    setAiStreamed('');
+    setAiAnswer(null);
     setAiSuggestions([]);
     setAiSelected([]);
     setAiMs(null);
     const t0 = Date.now();
     try {
-      const r = await requestAiReview(card.card_id);
+      const r = await requestAiReviewStream(
+        card.card_id,
+        aiMode === 'custom' ? { mode: 'custom', question: aiQuestion.trim() } : { mode: 'split' },
+        (text) => setAiStreamed(text),
+      );
       setAiSuggestions(r.suggestions);
       setAiSelected(r.suggestions.map(() => true));
+      setAiAnswer(r.answer);
     } catch (e) {
       setAiError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -542,6 +583,23 @@ function ReviewView() {
 
   const aiPickedCount = aiSelected.filter(Boolean).length;
 
+  const confirmDeleteCard = async () => {
+    if (!card || deleteBusy) return;
+    setDeleteError(null);
+    setDeleteBusy(true);
+    try {
+      await deleteCard(card.card_id);
+      setConfirmDelete(false);
+      await loadNext(deckId);
+      await refresh();
+      setStatus('Card deleted.');
+    } catch (e) {
+      setDeleteError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setDeleteBusy(false);
+    }
+  };
+
   const startEditing = () => {
     if (!card) return;
     setEditFront(htmlToText(card.front_html));
@@ -564,6 +622,9 @@ function ReviewView() {
       setEditing(false);
       // Suggestions (if any) were for the old wording.
       setAiOpen(false);
+      setAiStarted(false);
+      setAiStreamed('');
+      setAiAnswer(null);
       setAiSuggestions([]);
       setAiSelected([]);
     } catch (e) {
@@ -643,10 +704,15 @@ function ReviewView() {
               {status}
             </Typography>
           )}
-          <Box sx={{ mt: 2, display: 'flex', gap: 1 }}>
+          {card.created_at && (
+            <Typography variant="caption" color="text.secondary" sx={{ mt: 2, display: 'block' }}>
+              Created {fmtDate(card.created_at)}
+            </Typography>
+          )}
+          <Box sx={{ mt: 2, display: 'flex', gap: 1, flexWrap: 'wrap' }}>
             <Button
               variant="outlined"
-              onClick={startAiReview}
+              onClick={openAiReview}
               disabled={aiLoading || aiApplying || editing}
             >
               AI review
@@ -658,7 +724,44 @@ function ReviewView() {
             >
               Edit
             </Button>
+            <Button
+              variant="outlined"
+              color="error"
+              onClick={() => setConfirmDelete(true)}
+              disabled={deleteBusy || aiLoading || editing}
+            >
+              Delete
+            </Button>
           </Box>
+          {deleteError && (
+            <Alert severity="error" sx={{ mt: 2 }}>
+              {deleteError}
+            </Alert>
+          )}
+          {confirmDelete && (
+            <Box sx={{ mt: 2, pt: 2, borderTop: '1px dashed #aaa' }}>
+              <Typography variant="subtitle1" gutterBottom>
+                Delete this card?
+              </Typography>
+              <Typography variant="body2" color="text.secondary" gutterBottom>
+                This removes the card, its scheduling state, and its review
+                history. This cannot be undone.
+              </Typography>
+              <Box sx={{ display: 'flex', gap: 1, mt: 1 }}>
+                <Button onClick={() => setConfirmDelete(false)} disabled={deleteBusy}>
+                  Keep card
+                </Button>
+                <Button
+                  variant="contained"
+                  color="error"
+                  onClick={confirmDeleteCard}
+                  disabled={deleteBusy}
+                >
+                  {deleteBusy ? 'Deleting…' : 'Delete card'}
+                </Button>
+              </Box>
+            </Box>
+          )}
           {editing && (
             <Box sx={{ mt: 2, pt: 2, borderTop: '1px dashed #aaa' }}>
               <Typography variant="subtitle1" gutterBottom>
@@ -724,19 +827,88 @@ function ReviewView() {
                   </Typography>
                 )}
               </Typography>
-              {aiLoading && <CircularProgress aria-label="loading AI suggestions" />}
-              {aiError && (
+              {!aiStarted && (
+                <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+                  <RadioGroup
+                    aria-label="AI review option"
+                    value={aiMode}
+                    onChange={(e) => setAiMode(e.target.value as AiReviewMode)}
+                  >
+                    <FormControlLabel
+                      value="split"
+                      control={<Radio />}
+                      label="Split this card"
+                    />
+                    <FormControlLabel
+                      value="custom"
+                      control={<Radio />}
+                      label="Ask a question about this card"
+                    />
+                  </RadioGroup>
+                  <TextField
+                    label="Your question"
+                    placeholder="is this card still valid?"
+                    multiline
+                    minRows={2}
+                    value={aiQuestion}
+                    onChange={(e) => setAiQuestion(e.target.value)}
+                    helperText="Used when “Ask a question about this card” is selected."
+                  />
+                  {aiError && (
+                    <Alert severity="error" sx={{ mb: 0 }}>
+                      {aiError}
+                    </Alert>
+                  )}
+                  <Box sx={{ display: 'flex', gap: 1 }}>
+                    <Button onClick={() => setAiOpen(false)}>Cancel</Button>
+                    <Button
+                      variant="contained"
+                      onClick={runAiReview}
+                      disabled={aiLoading || (aiMode === 'custom' && !aiQuestion.trim())}
+                    >
+                      Ask AI
+                    </Button>
+                  </Box>
+                </Box>
+              )}
+              {aiStarted && aiLoading && (
+                <CircularProgress aria-label="loading AI suggestions" />
+              )}
+              {aiStarted && (aiLoading || aiStreamed) && aiMode === 'split' && (
+                <Paper
+                  variant="outlined"
+                  sx={{ p: 2, mb: 1, whiteSpace: 'pre-wrap', fontSize: '0.85rem' }}
+                  aria-live="polite"
+                  data-testid="ai-stream"
+                >
+                  {aiStreamed || '…'}
+                </Paper>
+              )}
+              {aiStarted && aiError && (
                 <Alert severity="error" sx={{ mb: 2 }}>
                   {aiError}
                 </Alert>
               )}
-              {!aiLoading && !aiError && aiSuggestions.length === 0 && (
-                <Alert severity="success">
-                  No changes suggested — the AI concluded this card already tests
-                  a single fact.
-                </Alert>
+              {aiStarted && !aiLoading && !aiError && aiMode === 'custom' && (
+                <Paper variant="outlined" sx={{ p: 2, mb: 1 }} data-testid="ai-answer">
+                  <Typography variant="body1" sx={{ whiteSpace: 'pre-wrap' }}>
+                    {aiAnswer}
+                  </Typography>
+                </Paper>
               )}
-              {!aiLoading &&
+              {aiStarted &&
+                !aiLoading &&
+                !aiError &&
+                aiMode === 'split' &&
+                aiSuggestions.length === 0 && (
+                  <Alert severity="success">
+                    No changes suggested — the AI concluded this card already tests
+                    a single fact.
+                  </Alert>
+                )}
+              {aiStarted &&
+                !aiLoading &&
+                !aiError &&
                 aiSuggestions.map((s, i) => (
                   <Paper key={i} variant="outlined" sx={{ p: 2, mb: 1 }}>
                     <FormControlLabel
@@ -754,7 +926,7 @@ function ReviewView() {
                     </Typography>
                   </Paper>
                 ))}
-              {!aiLoading && !aiError && aiSuggestions.length > 0 && (
+              {aiStarted && !aiLoading && !aiError && aiSuggestions.length > 0 && (
                 <FormControlLabel
                   control={
                     <Checkbox
@@ -765,12 +937,12 @@ function ReviewView() {
                   label="Delete the original card"
                 />
               )}
-              {!aiLoading && (
+              {aiStarted && !aiLoading && (
                 <Box sx={{ display: 'flex', gap: 1, mt: 1 }}>
                   <Button onClick={() => setAiOpen(false)} disabled={aiApplying}>
-                    Cancel
+                    {aiMode === 'custom' || aiSuggestions.length === 0 ? 'Close' : 'Cancel'}
                   </Button>
-                  {aiSuggestions.length > 0 && (
+                  {aiMode === 'split' && aiSuggestions.length > 0 && (
                     <Button
                       variant="contained"
                       onClick={applyAi}

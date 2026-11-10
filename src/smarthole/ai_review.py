@@ -11,6 +11,13 @@ import re
 AI_MODEL = os.getenv("AI_MODEL", "muse-spark-1.3-contributor")
 AI_BASE_URL = os.getenv("AI_BASE_URL", "https://api.meta.ai/v1")
 
+CUSTOM_SYSTEM_INSTRUCTIONS = """You answer questions about a flashcard.
+
+Rules:
+- Base your answer on the card's question and answer below.
+- Be concise: a few sentences at most.
+- Plain text only, no HTML."""
+
 SYSTEM_INSTRUCTIONS = """You split a flashcard into the smallest useful set of single-fact cards.
 
 Rules:
@@ -60,6 +67,30 @@ def build_prompt(front_html: str, back_html: str) -> str:
         'or {"cards": []} if the card already tests a single fact and needs '
         "no change."
     )
+
+
+def build_custom_prompt(front_html: str, back_html: str, question: str) -> str:
+    front = strip_html(front_html)
+    back = strip_html(back_html)
+    return (
+        "Answer this question about the flashcard below.\n\n"
+        f"Front:\n{front}\n\nBack:\n{back}\n\n"
+        f"Question:\n{(question or '').strip()}\n\n"
+        "Reply in plain text only."
+    )
+
+
+def extract_delta(event) -> str | None:
+    """Best-effort text delta from one Responses stream event."""
+    event_type = getattr(event, "type", None)
+    if event_type is None and isinstance(event, dict):
+        event_type = event.get("type")
+    if event_type != "response.output_text.delta":
+        return None
+    delta = getattr(event, "delta", None)
+    if delta is None and isinstance(event, dict):
+        delta = event.get("delta")
+    return str(delta) if delta else None
 
 
 def parse_suggestions(payload: str) -> list[dict]:
@@ -141,10 +172,7 @@ def extract_response_text(response) -> str:
     return str(response)
 
 
-def review_card_with_ai(
-    front_html: str, back_html: str, client=None
-) -> tuple[list[dict], str]:
-    """Call Muse Spark and return (suggestions, model name)."""
+def _require_client(client=None):
     api_key = os.environ.get("MODEL_API_KEY")
     if client is None and not api_key:
         raise RuntimeError("MODEL_API_KEY is not set")
@@ -152,9 +180,66 @@ def review_card_with_ai(
         from openai import OpenAI
 
         client = OpenAI(base_url=AI_BASE_URL, api_key=api_key)
+    return client
+
+
+def review_card_with_ai(
+    front_html: str, back_html: str, client=None
+) -> tuple[list[dict], str]:
+    """Call Muse Spark and return (suggestions, model name)."""
+    client = _require_client(client)
     response = client.responses.create(
         model=AI_MODEL,
         instructions=SYSTEM_INSTRUCTIONS,
         input=build_prompt(front_html, back_html),
     )
     return parse_suggestions(extract_response_text(response)), AI_MODEL
+
+
+def answer_question_with_ai(
+    front_html: str, back_html: str, question: str, client=None
+) -> tuple[str, str]:
+    """Answer a free-form question about a card; return (answer, model name)."""
+    if not (question or "").strip():
+        raise ValueError("A question is required")
+    client = _require_client(client)
+    response = client.responses.create(
+        model=AI_MODEL,
+        instructions=CUSTOM_SYSTEM_INSTRUCTIONS,
+        input=build_custom_prompt(front_html, back_html, question),
+    )
+    return extract_response_text(response).strip(), AI_MODEL
+
+
+def stream_review_with_ai(
+    front_html: str,
+    back_html: str,
+    mode: str = "split",
+    question: str | None = None,
+    client=None,
+):
+    """Yield raw text deltas from Muse Spark as they arrive.
+
+    ``mode`` is ``"split"`` (suggest single-fact cards as JSON) or
+    ``"custom"`` (answer ``question`` in plain text). The caller accumulates
+    the deltas and parses the full text once the stream ends.
+    """
+    if mode == "custom" and not (question or "").strip():
+        raise ValueError("A question is required")
+    client = _require_client(client)
+    if mode == "custom":
+        instructions = CUSTOM_SYSTEM_INSTRUCTIONS
+        prompt = build_custom_prompt(front_html, back_html, question or "")
+    else:
+        instructions = SYSTEM_INSTRUCTIONS
+        prompt = build_prompt(front_html, back_html)
+    stream = client.responses.create(
+        model=AI_MODEL,
+        instructions=instructions,
+        input=prompt,
+        stream=True,
+    )
+    for event in stream:
+        delta = extract_delta(event)
+        if delta:
+            yield delta

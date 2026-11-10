@@ -99,6 +99,7 @@ export interface ReviewCard {
   due: string;
   state: string;
   reps: number;
+  created_at?: string | null;
   /** Next-due ISO timestamps per rating ("1".."4"), for button labels. */
   intervals?: Record<string, string>;
 }
@@ -129,12 +130,107 @@ export interface AiSuggestion {
 
 export async function requestAiReview(
   cardId: string,
-): Promise<{ suggestions: AiSuggestion[]; model: string }> {
+  opts?: { mode: AiReviewMode; question?: string },
+): Promise<{ suggestions: AiSuggestion[]; answer?: string; model: string }> {
   const res = await apiFetch(`/cards/${encodeURIComponent(cardId)}/ai-review`, {
     method: 'POST',
-    body: JSON.stringify({}),
+    body: JSON.stringify(
+      opts?.mode === 'custom'
+        ? { mode: 'custom', question: opts.question ?? '' }
+        : {},
+    ),
   });
   return readJson(res);
+}
+
+export type AiReviewMode = 'split' | 'custom';
+
+export interface AiReviewStreamResult {
+  suggestions: AiSuggestion[];
+  answer: string | null;
+  model: string;
+  raw: string;
+}
+
+/**
+ * Stream an AI review, calling `onText` with the full text received so far
+ * as each chunk arrives, and resolving with the parsed final result.
+ */
+export async function requestAiReviewStream(
+  cardId: string,
+  opts: { mode: AiReviewMode; question?: string },
+  onText: (fullText: string) => void,
+): Promise<AiReviewStreamResult> {
+  const q =
+    `?mode=${opts.mode}` +
+    (opts.mode === 'custom' ? `&question=${encodeURIComponent(opts.question ?? '')}` : '');
+  const res = await apiFetch(`/cards/${encodeURIComponent(cardId)}/ai-review/stream${q}`);
+  if (!res.ok) {
+    const text = await res.text().catch(() => res.statusText);
+    throw new Error(text || `Request failed: ${res.status}`);
+  }
+  if (!res.body) {
+    const fallback = await requestAiReview(
+      cardId,
+      opts.mode === 'custom' ? { mode: opts.mode, question: opts.question } : undefined,
+    );
+    return {
+      suggestions: fallback.suggestions,
+      answer: fallback.answer ?? null,
+      model: fallback.model,
+      raw: '',
+    };
+  }
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let raw = '';
+  const flush = (final: boolean) => {
+    const lines = buffer.split('\n');
+    buffer = final ? '' : (lines.pop() ?? '');
+    return final ? [...lines, buffer].filter((l) => l.trim()) : lines;
+  };
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    for (const line of flush(false)) {
+      if (!line.trim()) continue;
+      const event = JSON.parse(line);
+      if (event.error) throw new Error(event.error);
+      if (typeof event.delta === 'string') {
+        raw += event.delta;
+        onText(raw);
+      }
+      if (event.done) {
+        return {
+          suggestions: event.suggestions ?? [],
+          answer: event.answer ?? null,
+          model: event.model ?? '',
+          raw,
+        };
+      }
+    }
+  }
+  buffer += decoder.decode();
+  for (const line of flush(true)) {
+    if (!line.trim()) continue;
+    const event = JSON.parse(line);
+    if (event.error) throw new Error(event.error);
+    if (typeof event.delta === 'string') {
+      raw += event.delta;
+      onText(raw);
+    }
+    if (event.done) {
+      return {
+        suggestions: event.suggestions ?? [],
+        answer: event.answer ?? null,
+        model: event.model ?? '',
+        raw,
+      };
+    }
+  }
+  throw new Error('AI review ended without a result.');
 }
 
 export async function deleteCard(cardId: string): Promise<void> {

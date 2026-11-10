@@ -73,6 +73,11 @@ class CardUpdateBody(BaseModel):
     back: str
 
 
+class AiReviewBody(BaseModel):
+    mode: Literal["split", "custom"] = "split"
+    question: str | None = None
+
+
 class GoogleBody(BaseModel):
     token: str
 
@@ -396,13 +401,38 @@ def create_app() -> FastAPI:
         }
 
     @app.post("/api/cards/{card_id}/ai-review")
-    def ai_review_card(card_id: str, user: User = Depends(get_current_user)):
+    def ai_review_card(
+        card_id: str,
+        body: AiReviewBody | None = None,
+        user: User = Depends(get_current_user),
+    ):
         try:
             card = Card.objects(id=card_id).first()
         except Exception:
             card = None
         if card is None or card.deck.owner.id != user.id:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "Card not found")
+        mode = (body.mode if body else "split") or "split"
+        question = (body.question if body else None) or None
+        if mode == "custom":
+            if not (question or "").strip():
+                raise HTTPException(
+                    status.HTTP_400_BAD_REQUEST,
+                    "A question is required for a custom AI review",
+                )
+            try:
+                answer, model = ai_review.answer_question_with_ai(
+                    card.front_html, card.back_html, question.strip()
+                )
+            except RuntimeError as exc:
+                raise HTTPException(
+                    status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)
+                ) from exc
+            except Exception as exc:
+                raise HTTPException(
+                    status.HTTP_502_BAD_GATEWAY, f"AI review failed: {exc}"
+                ) from exc
+            return {"answer": answer, "model": model}
         try:
             suggestions, model = ai_review.review_card_with_ai(
                 card.front_html, card.back_html
@@ -416,6 +446,71 @@ def create_app() -> FastAPI:
                 status.HTTP_502_BAD_GATEWAY, f"AI review failed: {exc}"
             ) from exc
         return {"suggestions": suggestions, "model": model}
+
+    @app.get("/api/cards/{card_id}/ai-review/stream")
+    def ai_review_stream(
+        card_id: str,
+        mode: Literal["split", "custom"] = Query(default="split"),
+        question: str | None = Query(default=None),
+        user: User = Depends(get_current_user),
+    ):
+        try:
+            card = Card.objects(id=card_id).first()
+        except Exception:
+            card = None
+        if card is None or card.deck.owner.id != user.id:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Card not found")
+        if mode == "custom" and not (question or "").strip():
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                "A question is required for a custom AI review",
+            )
+        front_html, back_html = card.front_html, card.back_html
+        clean_question = (question or "").strip() or None
+
+        def stream_lines():
+            def line(obj) -> bytes:
+                return (json.dumps(obj) + "\n").encode("utf-8")
+
+            try:
+                chunks: list[str] = []
+                for delta in ai_review.stream_review_with_ai(
+                    front_html, back_html, mode=mode, question=clean_question
+                ):
+                    chunks.append(delta)
+                    yield line({"delta": delta})
+                full = "".join(chunks)
+                if mode == "custom":
+                    yield line(
+                        {
+                            "done": True,
+                            "answer": full.strip(),
+                            "model": ai_review.AI_MODEL,
+                        }
+                    )
+                else:
+                    try:
+                        suggestions = ai_review.parse_suggestions(full)
+                    except Exception as exc:
+                        yield line({"error": f"AI reply was not valid JSON: {exc}"})
+                        return
+                    yield line(
+                        {
+                            "done": True,
+                            "suggestions": suggestions,
+                            "model": ai_review.AI_MODEL,
+                        }
+                    )
+            except RuntimeError as exc:
+                yield line({"error": str(exc), "status": 503})
+            except ValueError as exc:
+                yield line({"error": str(exc), "status": 400})
+            except Exception as exc:
+                yield line({"error": f"AI review failed: {exc}", "status": 502})
+
+        return StreamingResponse(
+            stream_lines(), media_type="application/x-ndjson"
+        )
 
     @app.delete("/api/cards/{card_id}")
     def delete_card(card_id: str, user: User = Depends(get_current_user)):
@@ -959,6 +1054,7 @@ def _present_state(state: CardState) -> dict:
         "due": state.due.isoformat(),
         "state": state.state,
         "reps": state.reps,
+        "created_at": card.created_at.isoformat() if card.created_at else None,
         "intervals": _preview_intervals(state, utcnow()),
     }
 
