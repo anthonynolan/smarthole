@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import logging
 import mimetypes
 import os
 import re
@@ -35,7 +36,9 @@ from pydantic import BaseModel, EmailStr
 
 load_dotenv()
 
-from . import ai_review, apkg_import, fsrs_service, mongo_connection
+logger = logging.getLogger(__name__)
+
+from . import ai_review, apkg_import, embeddings, fsrs_service, mongo_connection
 from .auth import (
     SESSION_COOKIE,
     SESSION_DAYS,
@@ -84,6 +87,49 @@ class GoogleBody(BaseModel):
 
 def utcnow() -> datetime:
     return datetime.now(UTC)
+
+
+def _related_min_score() -> float:
+    try:
+        return float(os.getenv("RELATED_MIN_SCORE", "0.7"))
+    except ValueError:
+        return 0.7
+
+
+def find_related_cards(user: User, card: Card, limit: int = 3) -> list[dict]:
+    """Cards most similar to ``card`` (similarity desc, above min score).
+
+    Searches the user's own decks, excluding the card itself, deleted,
+    and suspended cards. Raises when no query vector is available or
+    Atlas/a vector index is missing — the endpoint degrades to
+    ``unavailable``.
+    """
+    query_vector = list(card.embedding or [])
+    if not query_vector:
+        text = embeddings.card_embedding_text(card.front_html, card.back_html)
+        query_vector, _ = embeddings.embed_text(text)
+    deck_ids = [d.id for d in Deck.objects(owner=user)]
+    rows = embeddings.similar_cards(
+        Card._get_collection(),
+        query_vector,
+        exclude_id=card.id,
+        deck_ids=deck_ids or None,
+        limit=limit,
+        min_score=_related_min_score(),
+    )
+    decks = {d.id: d for d in Deck.objects(id__in=[r["deck"] for r in rows])} if rows else {}
+    out = []
+    for r in rows:
+        deck = decks.get(r["deck"])
+        out.append(
+            {
+                "card_id": str(r["_id"]),
+                "front_text": plain_text(r.get("front_html") or ""),
+                "deck_name": deck.name if deck else "",
+                "score": round(float(r.get("score") or 0), 4),
+            }
+        )
+    return out
 
 
 # MCP (Streamable HTTP) for external AI clients such as ChatGPT.
@@ -374,6 +420,9 @@ def create_app() -> FastAPI:
             back_html=apkg_import.render_plain_text(body.back),
             new_position=new_position,
         ).save()
+        # Best-effort: a missing key or API failure just leaves the card
+        # unembedded until the backfill script runs.
+        embeddings.refresh_card_embedding(card)
         CardState(
             user=user,
             card=card,
@@ -401,6 +450,7 @@ def create_app() -> FastAPI:
             set__back_html=apkg_import.render_plain_text(body.back),
         )
         card.reload()
+        embeddings.refresh_card_embedding(card)
         return {
             "card_id": str(card.id),
             "deck_id": str(card.deck.id),
@@ -560,6 +610,45 @@ def create_app() -> FastAPI:
         if card.deleted:
             card.update(set__deleted=False, unset__deleted_at=True)
         return {"restored": card_id}
+
+    @app.get("/api/cards/{card_id}")
+    def get_card(card_id: str, user: User = Depends(get_current_user)):
+        """Full review payload for one card (used to queue a related card)."""
+        try:
+            card = Card.objects(id=card_id).first()
+        except Exception:
+            card = None
+        if card is None or card.deck.owner.id != user.id or card.deleted:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Card not found")
+        state = CardState.objects(user=user, card=card).first()
+        if state is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "No state for this card")
+        return _present_state(state)
+
+    @app.get("/api/cards/{card_id}/related")
+    def related_cards(
+        card_id: str,
+        limit: int = Query(default=3, ge=1, le=10),
+        user: User = Depends(get_current_user),
+    ):
+        """Cards most similar to this one, for the review "related" hint.
+
+        Returns only cards at or above RELATED_MIN_SCORE. When embeddings
+        are unavailable (no key, no vector index) the list is empty with
+        ``unavailable: True`` so the UI can hide the hint.
+        """
+        try:
+            card = Card.objects(id=card_id).first()
+        except Exception:
+            card = None
+        if card is None or card.deck.owner.id != user.id or card.deleted:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Card not found")
+        try:
+            rows = find_related_cards(user, card, limit=limit)
+        except Exception as exc:
+            logger.warning("related search unavailable: %s", exc)
+            return {"cards": [], "unavailable": True}
+        return {"cards": rows, "unavailable": False}
 
     @app.post("/api/import", status_code=201)
     def import_apkg(

@@ -14,6 +14,7 @@ from mongoengine import (
     Document,
     FloatField,
     IntField,
+    ListField,
     ReferenceField,
     StringField,
 )
@@ -71,6 +72,10 @@ class Card(Document):
     created_at = DateTimeField(default=utcnow)
     deleted = BooleanField(default=False)  # logical delete; hard delete purges
     deleted_at = DateTimeField()
+    # OpenAI embedding for similarity search (Atlas vector index
+    # 'card_embedding_index' on this path; also the basis for DB chat).
+    embedding = ListField(FloatField(), default=list)
+    embedding_model = StringField()
 
 
 class CardState(Document):

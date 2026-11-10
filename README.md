@@ -38,6 +38,15 @@ separate database) + py-fsrs.
   option and question stay visible while the call runs; live statuses
   (`sent`, `awaiting response`, `streaming`, `finished`) and the model
   name are shown.
+- Card embeddings (OpenAI `text-embedding-3-small`, same method as
+  grimoire) with an Atlas vector index for similarity search. While
+  reviewing, the closest related card appears as a title link — click it
+  before grading and it goes next in the review queue. Setup: add
+  `OPENAI_API_KEY` to `.env` and `.env.prod`, then run
+  `uv run scripts/create_card_vector_index.py --db smarthole_prod` once
+  and `uv run scripts/backfill_card_embeddings.py --db smarthole_prod`
+  to embed existing cards (new/edited cards embed automatically).
+  Tune with `EMBEDDING_MODEL` and `RELATED_MIN_SCORE` (default 0.7).
 - Stats: due/new/learning/reviewed-today counts, today's accuracy, and a
   30-day due forecast. Dates render unambiguously as `12-Nov'26`.
 - Deploy via GitHub Actions on every push to `master` (see

@@ -763,6 +763,69 @@ test('edit panel shows full card metadata for troubleshooting', async () => {
   vi.unstubAllGlobals();
 });
 
+test('related card link queues it next after grading', async () => {
+  const c1 = {
+    card_id: 'c1',
+    deck_id: 'd1',
+    front_html: 'Q1',
+    back_html: 'A1',
+    due: '2026-11-08',
+    state: 2,
+    reps: 1,
+  };
+  const c2 = {
+    card_id: 'c2',
+    deck_id: 'd1',
+    front_html: 'Q2',
+    back_html: 'A2',
+    due: '2026-11-08',
+    state: 2,
+    reps: 1,
+  };
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (url: any, init?: any) => {
+      const u = String(url);
+      const body = (v: any) => ({ ok: true, json: () => Promise.resolve(v) });
+      if (u === '/api/config') return body({ googleClientId: null });
+      if (u === '/api/me') return body({ email: 't@example.com' });
+      if (u === '/api/decks')
+        return body({
+          decks: [{ id: 'd1', name: 'Test', total: 10, due: 3, due_today: 5, new: 2 }],
+        });
+      if (u.startsWith('/api/next')) {
+        // Initial load and prefetch: only the first call has no exclude.
+        if (u.includes('exclude')) return body({ cards: [] });
+        return body({ cards: [c1] });
+      }
+      if (u.startsWith('/api/cards/c1/related'))
+        return body({
+          cards: [{ card_id: 'c2', front_text: 'Q2', deck_name: 'Test', score: 0.9 }],
+          unavailable: false,
+        });
+      if (u.startsWith('/api/cards/c2/related'))
+        return body({ cards: [], unavailable: true });
+      if (u === '/api/cards/c2' && init?.method !== 'DELETE') return body(c2);
+      if (u === '/api/review/c1' && init?.method === 'POST') return body(c1);
+      throw new Error(`unexpected fetch ${u} ${init?.method ?? 'GET'}`);
+    }),
+  );
+  render(<App />);
+  // The related hint shows the closest card as a title link.
+  await waitFor(() => expect(screen.getByTestId('related-hint')).toBeTruthy());
+  expect(screen.getByTestId('related-hint')).toHaveTextContent('Q2');
+  // Clicking it queues the related card instead of navigating away.
+  fireEvent.click(screen.getByText('Q2'));
+  await waitFor(() => expect(screen.getByTestId('queued-next')).toBeTruthy());
+  expect(screen.getByTestId('queued-next')).toHaveTextContent('Q2');
+  // Grading the current card shows the queued card next.
+  fireEvent.click(screen.getByRole('button', { name: 'Show answer' }));
+  fireEvent.click(screen.getByRole('button', { name: 'Good' }));
+  await waitFor(() => expect(screen.getByText('Q2', { selector: 'div' })).toBeTruthy());
+  expect(screen.queryByTestId('queued-next')).toBeNull();
+  vi.unstubAllGlobals();
+});
+
 test('browse show-deleted lists only deleted cards with restore', async () => {
   const live = {
     card_id: 'c1',

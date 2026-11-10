@@ -149,6 +149,30 @@ export async function gradeCard(cardId: string, rating: number): Promise<ReviewC
   return readJson(res);
 }
 
+/** Full review payload for one card (used to queue a related card next). */
+export async function getCard(cardId: string): Promise<ReviewCard> {
+  const res = await apiFetch(`/cards/${encodeURIComponent(cardId)}`);
+  return readJson(res);
+}
+
+export interface RelatedCard {
+  card_id: string;
+  front_text: string;
+  deck_name: string;
+  score: number;
+}
+
+/** Cards most similar to this one (empty + unavailable when not indexed). */
+export async function getRelated(
+  cardId: string,
+  limit = 3,
+): Promise<{ cards: RelatedCard[]; unavailable: boolean }> {
+  const res = await apiFetch(
+    `/cards/${encodeURIComponent(cardId)}/related?limit=${limit}`,
+  );
+  return readJson(res);
+}
+
 export interface AiSuggestion {
   front: string;
   back: string;

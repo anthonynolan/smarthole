@@ -41,9 +41,11 @@ import {
   deleteCard,
   fmtDate,
   fmtInterval,
+  getCard,
   getDecks,
   getMe,
   getNext,
+  getRelated,
   getStats,
   googleLogin,
   gradeCard,
@@ -63,6 +65,7 @@ import {
   type BrowseCard,
   type CardMeta,
   type Deck,
+  type RelatedCard,
   type ReviewCard,
   type Stats,
 } from './api';
@@ -489,6 +492,9 @@ function ReviewView() {
   const [editBack, setEditBack] = useState('');
   const [editBusy, setEditBusy] = useState(false);
   const [editError, setEditError] = useState<string | null>(null);
+  const [related, setRelated] = useState<RelatedCard[]>([]);
+  const [queued, setQueued] = useState<ReviewCard | null>(null);
+  const [queueBusy, setQueueBusy] = useState(false);
 
   // Best-effort preload of the card after the current one, so grading
   // swaps instantly instead of waiting on a fetch.
@@ -522,6 +528,8 @@ function ReviewView() {
     setAiModel(null);
     setConfirmDelete(false);
     setDeleteError(null);
+    setRelated([]);
+    setQueued(null);
     try {
       const cards = await getNext(deck as '');
       const first = cards[0] ?? null;
@@ -539,12 +547,43 @@ function ReviewView() {
     loadNext(deckId);
   }, [deckId, loadNext]);
 
+  // Similarity hint: closest related card across the whole database.
+  // Runs in the background; hides itself when embeddings are unavailable.
+  const relatedFor = card?.card_id ?? null;
+  useEffect(() => {
+    if (!relatedFor) {
+      setRelated([]);
+      return;
+    }
+    let cancelled = false;
+    getRelated(relatedFor)
+      .then((r) => {
+        if (!cancelled) setRelated(r.cards ?? []);
+      })
+      .catch(() => {
+        if (!cancelled) setRelated([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [relatedFor]);
+
   const grade = async (rating: number) => {
     if (!card) return;
     setError(null);
     try {
       await gradeCard(card.card_id, rating);
-      if (preloaded && preloaded.card_id !== card.card_id) {
+      const upNext = queued && queued.card_id !== card.card_id ? queued : null;
+      if (upNext) {
+        // A related card was queued: it goes next, ahead of the preload.
+        setQueued(null);
+        setPreloaded(null);
+        setCard(upNext);
+        setShowBack(false);
+        setStatus(null);
+        setRelated([]);
+        void prefetchNext(deckId, upNext.card_id);
+      } else if (preloaded && preloaded.card_id !== card.card_id) {
         const next = preloaded;
         setPreloaded(null);
         setCard(next);
@@ -558,6 +597,20 @@ function ReviewView() {
       await refresh();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  const queueRelated = async () => {
+    if (!related.length || queueBusy) return;
+    setQueueBusy(true);
+    setError(null);
+    try {
+      const full = await getCard(related[0].card_id);
+      setQueued(full);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setQueueBusy(false);
     }
   };
 
@@ -766,6 +819,56 @@ function ReviewView() {
           {status && (
             <Typography variant="body2" color="text.secondary" sx={{ mt: 1 }}>
               {status}
+            </Typography>
+          )}
+          {related.length > 0 && !queued && (
+            <Typography
+              variant="body2"
+              color="text.secondary"
+              sx={{ mt: 1 }}
+              data-testid="related-hint"
+            >
+              Related:{' '}
+              <Button
+                variant="text"
+                size="small"
+                onClick={queueRelated}
+                disabled={queueBusy}
+                sx={{
+                  textTransform: 'none',
+                  p: 0,
+                  minWidth: 0,
+                  verticalAlign: 'baseline',
+                  fontSize: 'inherit',
+                }}
+              >
+                {related[0].front_text}
+              </Button>
+              {related[0].deck_name ? ` (${related[0].deck_name})` : ''}
+            </Typography>
+          )}
+          {queued && (
+            <Typography
+              variant="body2"
+              color="text.secondary"
+              sx={{ mt: 1 }}
+              data-testid="queued-next"
+            >
+              Up next: {htmlToText(queued.front_html).slice(0, 80)}{' '}
+              <Button
+                variant="text"
+                size="small"
+                onClick={() => setQueued(null)}
+                sx={{
+                  textTransform: 'none',
+                  p: 0,
+                  minWidth: 0,
+                  verticalAlign: 'baseline',
+                  fontSize: 'inherit',
+                }}
+              >
+                Clear
+              </Button>
             </Typography>
           )}
           {card.created_at && (
