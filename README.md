@@ -60,8 +60,8 @@ cp .env.example .env   # fill in MONGO_PWD (Atlas password, never commit it)
 ./dev_start_uvicorn.sh
 ```
 
-Open `http://localhost:8123` in a browser. (Port 8123 avoids your `tracker`
-app on 8001.)
+Open `http://localhost:8123` in a browser. (Port 8123 avoids clashes
+with your other local apps.)
 
 The UI is React + MUI in `smarthole-client/` (same stack as grimoire's
 client). First build it once:

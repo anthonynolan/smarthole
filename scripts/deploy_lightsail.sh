@@ -2,9 +2,9 @@
 set -euo pipefail
 # Deploy smarthole to the shared Lightsail instance. Run from the repo root:
 #   bash scripts/deploy_lightsail.sh
-# Mirrors tracker/scripts/deploy_lightsail.sh: local gates, rsync code
-# (never .env), validate/reload nginx with restore, restart the systemd
-# service, then loopback healthchecks for smarthole AND Grimoire AND tracker.
+# Local gates, rsync code (never .env), validate/reload nginx with
+# restore, restart the systemd service, then loopback healthchecks for
+# smarthole AND Grimoire.
 #
 # First-deploy order: DNS (done: A smarthole.cathalanddad.com -> static IP)
 # -> Atlas smarthole_prod access for the app user (docs/deploy.md)
@@ -113,10 +113,8 @@ curl --fail --silent --show-error --retry 12 --retry-delay 5 --retry-connrefused
     --connect-timeout 5 --max-time 10 http://127.0.0.1:8003/api/config
 sudo systemctl is-active --quiet smarthole
 
-# Shared box: prove Grimoire and tracker survived the nginx reload + deploy.
+# Shared box: prove Grimoire survived the nginx reload + deploy.
 curl --fail --silent --show-error --max-time 10 \
     http://127.0.0.1:8000/healthcheck
-curl --fail --silent --show-error --max-time 10 \
-    http://127.0.0.1:8002/health
-echo "smarthole + grimoire + tracker healthchecks passed"
+echo "smarthole + grimoire healthchecks passed"
 EOF

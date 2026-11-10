@@ -3,7 +3,7 @@
 ## Architecture
 
 - **Host:** shared Lightsail instance (Amazon Linux, eu-west-1, 1 GB RAM /
-  2 vCPU / 40 GB disk), also running Grimoire and Tracker. SSH:
+  2 vCPU / 40 GB disk), also running Grimoire. SSH:
   `ssh ec2-user@34.251.161.194 -i ~/.ssh/LightsailDefaultKey-eu-west-1.pem`
 - **DNS:** `smarthole.cathalanddad.com` is a Route53 A record (TTL 300) at the
   instance's static IP. DNS for this domain is in Route53, not Lightsail DNS.
@@ -25,11 +25,10 @@
 | Owner    | Loopback ports | nginx conf                  | systemd unit | Remote dir              |
 |----------|----------------|-----------------------------|--------------|-------------------------|
 | Grimoire | 8000, 8001     | `/etc/nginx/conf.d/api.conf`      | `fastapi`  | `/home/ec2-user/app`      |
-| Tracker  | 8002           | `/etc/nginx/conf.d/tracker.conf`  | `tracker`  | `/home/ec2-user/tracker`  |
 | Smarthole| 8003           | `/etc/nginx/conf.d/smarthole.conf`| `smarthole`| `/home/ec2-user/smarthole`|
 
 Never take another row's port or edit its conf/unit. nginx reloads affect
-all apps: every deploy healthchecks Grimoire and Tracker too.
+all apps: every deploy healthchecks Grimoire too.
 
 ## One-time setup (in order)
 
@@ -39,8 +38,7 @@ all apps: every deploy healthchecks Grimoire and Tracker too.
    Z102462912W4NHCQ089PL` shows the record, and public DNS resolves it.
 2. Atlas: database `smarthole_prod`, a user with `readWrite` on
    `smarthole_prod`, and the Lightsail static IP in Network Access. Same
-   cluster/user pattern as Grimoire (`myAtlasDBUser`); see tracker's
-   `docs/mongo.md` for the field-level checklist.
+   cluster/user pattern as Grimoire (`myAtlasDBUser`).
 3. Production env: keep the values in repo-root `.env.prod` (git-ignored,
    never committed, content never in chat). The deploy script copies it to
    `/home/ec2-user/smarthole/.env` (`0600`) on every run. Required keys:
@@ -80,8 +78,8 @@ manifests + deploy files, ships `.env.prod` as the server `.env`
 (renamed on arrival); then on the server runs
 `uv sync --locked`, installs the nginx conf with validate-before-reload and
 automatic restore, restarts the `smarthole` service, and healthchecks
-smarthole (`:8003/api/config`) plus Grimoire (`:8000/healthcheck`) and
-tracker (`:8002/health`) over loopback.
+smarthole (`:8003/api/config`) plus Grimoire (`:8000/healthcheck`)
+over loopback.
 
 Post-deploy smoke from your laptop:
 
@@ -89,7 +87,6 @@ Post-deploy smoke from your laptop:
 curl -s https://smarthole.cathalanddad.com/api/config
 curl -sI http://smarthole.cathalanddad.com/ | head -1   # 301 to https
 curl -s https://api.cathalanddad.com/healthcheck       # Grimoire alive
-curl -s https://tracker.cathalanddad.com/health        # Tracker alive
 ```
 
 Then sign in once in the browser (email + Google) and import a small deck.
@@ -98,7 +95,7 @@ Then sign in once in the browser (email + Google) and import a small deck.
 
 - Logs: `journalctl -u smarthole -e` (app), `/var/log/nginx/` (access/error).
 - Restart: `sudo systemctl restart smarthole`; enable-on-boot is on
-  (`WantedBy=multi-user.target`), as is nginx. Re-verify all three
+  (`WantedBy=multi-user.target`), as is nginx. Re-verify both
   healthchecks after any reboot.
 - Memory: the box idles with ~160 MB free and no swap. Keep imports modest;
   if OOMs appear, the fix is a bigger Lightsail plan or a swapfile,
@@ -129,8 +126,8 @@ Then sign in once in the browser (email + Google) and import a small deck.
 - `413` on import: `client_max_body_size` in `deploy/smarthole.conf`.
 - `https://` stops working after a deploy: the commit-back step was missed
   and TLS was overwritten — re-run certbot, then commit the live conf back.
-- Grimoire/tracker `502`s after a smarthole deploy: their services/confs
-  were untouched by design — check `systemctl status fastapi tracker`
-  and `sudo nginx -t`; restore their confs from their repo copies if needed.
+- Grimoire `502`s after a smarthole deploy: its service/conf was
+  untouched by design — check `systemctl status fastapi`
+  and `sudo nginx -t`; restore its conf from the grimoire repo copy if needed.
 - Google sign-in fails in production only: the production origin is not in
   the OAuth client's authorized origins (Google Cloud console).
