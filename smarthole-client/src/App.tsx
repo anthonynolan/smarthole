@@ -774,6 +774,11 @@ function ReviewView() {
       )}
       {card && (
         <Paper sx={{ p: 3, mt: 1 }}>
+          {card.created_at && (
+            <Typography variant="caption" color="text.secondary" sx={{ mb: 1, display: 'block' }}>
+              Created {fmtDate(card.created_at)}
+            </Typography>
+          )}
           <Box
             sx={{ ...qaTextSx, minHeight: 80 }}
             dangerouslySetInnerHTML={{ __html: card.front_html }}
@@ -869,11 +874,6 @@ function ReviewView() {
               >
                 Clear
               </Button>
-            </Typography>
-          )}
-          {card.created_at && (
-            <Typography variant="caption" color="text.secondary" sx={{ mt: 2, display: 'block' }}>
-              Created {fmtDate(card.created_at)}
             </Typography>
           )}
           <Box sx={{ mt: 2, display: 'flex', gap: 1, flexWrap: 'wrap' }}>
