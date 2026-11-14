@@ -312,33 +312,68 @@ def create_app() -> FastAPI:
 
     @app.get("/api/decks")
     def list_decks(user: User = Depends(get_current_user)):
-        decks = Deck.objects(owner=user)
+        decks = list(Deck.objects(owner=user))
+        # Tiny (id, suspended) projections only: full Card documents carry
+        # the HTML and embedding vectors, which dwarf what this view needs.
+        # values_list never dereferences, so this stays one small query
+        # per deck no matter how large the decks are.
+        cards_by_deck: dict[str, list] = {}
+        active_by_deck: dict[str, list] = {}
+        for deck in decks:
+            key = str(deck.id)
+            rows = Card.objects(deck=deck, deleted__ne=True).values_list(
+                "id", "suspended"
+            )
+            card_ids = []
+            active_ids = []
+            for card_id, suspended in rows:
+                card_ids.append(card_id)
+                if not suspended:
+                    active_ids.append(card_id)
+            cards_by_deck[key] = card_ids
+            active_by_deck[key] = active_ids
+        # One state query for all decks; per-deck due/new/due_today tallies
+        # are computed in Python. Raw collection access keeps the card
+        # reference as an id (ORM access would fetch every Card document).
+        now = utcnow()
+        tomorrow = _day_start() + timedelta(days=1)
+        counts: dict[str, dict[str, int]] = {
+            str(deck.id): {"due": 0, "new": 0, "due_today": 0} for deck in decks
+        }
+        deck_of: dict = {}
+        for key, ids in active_by_deck.items():
+            for card_id in ids:
+                deck_of[card_id] = key
+        all_active = [i for ids in active_by_deck.values() for i in ids]
+        if all_active:
+            coll = CardState._get_collection()
+            for s in coll.find(
+                {"user": user.id, "card": {"$in": all_active}},
+                {"card": 1, "reps": 1, "due": 1},
+            ):
+                entry = counts.get(deck_of.get(s["card"]))
+                if entry is None:
+                    continue
+                reps = s.get("reps") or 0
+                due = s.get("due")
+                if reps > 0 and due is not None and fsrs_service.ensure_aware(due) <= now:
+                    entry["due"] += 1
+                if reps == 0:
+                    entry["new"] += 1
+                if reps > 0 and due is not None and fsrs_service.ensure_aware(due) < tomorrow:
+                    entry["due_today"] += 1
         out = []
         for deck in decks:
-            cards = list(Card.objects(deck=deck, deleted__ne=True))
-            active_ids = [c.id for c in cards if not c.suspended]
-            if active_ids:
-                due = CardState.objects(
-                    user=user, card__in=active_ids, reps__gt=0, due__lte=utcnow()
-                ).count()
-                new = CardState.objects(user=user, card__in=active_ids, reps=0).count()
-                day_start = utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
-                due_today = CardState.objects(
-                    user=user,
-                    card__in=active_ids,
-                    reps__gt=0,
-                    due__lt=day_start + timedelta(days=1),
-                ).count()
-            else:
-                due = new = due_today = 0
+            key = str(deck.id)
+            entry = counts[key]
             out.append(
                 {
-                    "id": str(deck.id),
+                    "id": key,
                     "name": deck.name,
-                    "total": len(cards),
-                    "due": due,
-                    "due_today": due_today,
-                    "new": new,
+                    "total": len(cards_by_deck[key]),
+                    "due": entry["due"],
+                    "due_today": entry["due_today"],
+                    "new": entry["new"],
                 }
             )
         return {"decks": out}
@@ -369,12 +404,25 @@ def create_app() -> FastAPI:
             cards_query = cards_query.filter(
                 Q(front_html__icontains=needle) | Q(back_html__icontains=needle)
             )
-        card_ids = [c.id for c in cards_query]
+        # ids only: never materialize full Card documents (HTML + embedding
+        # vectors) for the whole deck to serve one page of rows.
+        card_ids = list(cards_query.values_list("id"))
         total = (
             CardState.objects(user=user, card__in=card_ids).count() if card_ids else 0
         )
         states = _paged_states(user, card_ids, sort, direction, skip, limit)
-        cards = {c.id: c for c in Card.objects(id__in=[s.card.id for s in states])}
+        # Reuse the dereferenced page cards directly: the old
+        # Card.objects(id__in=[s.card.id ...]) lookup re-fetched the same
+        # documents a second time.
+        cards = {}
+        for s in states:
+            try:
+                card = s.card
+            except Exception:
+                continue
+            if card is None:
+                continue
+            cards[card.id] = card
         tomorrow = _day_start() + timedelta(days=1)
         rows = []
         for s in states:
@@ -1067,7 +1115,6 @@ def _paged_states(
     field = "due" if sort == "due" else "last_review"
     prefix = "-" if direction == "desc" else ""
     present_query = {"user": user, "card__in": card_ids, f"{field}__ne": None}
-    total_present = CardState.objects(**present_query).count()
     page = list(
         CardState.objects(**present_query)
         .order_by(f"{prefix}{field}")
@@ -1075,7 +1122,12 @@ def _paged_states(
         .limit(limit)
     )
     if len(page) < limit:
-        null_skip = max(0, skip - total_present)
+        # First pages never need this count: nothing was skipped, so the
+        # null-valued tail starts at offset 0.
+        null_skip = 0
+        if skip > 0:
+            total_present = CardState.objects(**present_query).count()
+            null_skip = max(0, skip - total_present)
         null_query = {"user": user, "card__in": card_ids, field: None}
         page += list(
             CardState.objects(**null_query)

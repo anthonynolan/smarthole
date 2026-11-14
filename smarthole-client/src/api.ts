@@ -368,7 +368,7 @@ export interface BrowseCard {
   due_today: boolean;
 }
 
-export const BROWSE_PAGE = 20;
+export const BROWSE_PAGE = 50;
 
 export async function browseCards(
   deckId: string,

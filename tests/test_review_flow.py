@@ -915,3 +915,46 @@ def test_decks_reports_due_today(client, tmp_path):
     assert decks[0]["due"] == 1
     assert decks[0]["new"] == 0
     assert decks[0]["due_today"] == expected_today
+
+
+def test_decks_counts_grouped_per_deck(client, tmp_path):
+    """list_decks tallies every deck from one shared state query."""
+    from datetime import datetime, timedelta, timezone
+
+    from smarthole.models import Card, CardState, Deck, User
+
+    register(client)
+    user = User.objects(email="user@example.com").first()
+    d1 = Deck(owner=user, name="D1").save()
+    d2 = Deck(owner=user, name="D2").save()
+    now = datetime.now(timezone.utc)
+
+    def add(deck, reps, due, suspended=False, deleted=False):
+        card = Card(
+            deck=deck,
+            front_html="Q",
+            back_html="A",
+            suspended=suspended,
+            deleted=deleted,
+        ).save()
+        CardState(
+            user=user, card=card, fsrs_card_id=1, state=2, due=due, reps=reps
+        ).save()
+
+    past = now - timedelta(hours=1)
+    add(d1, 0, now)  # new
+    add(d1, 3, past)  # due and due today
+    add(d1, 3, now + timedelta(days=2))  # scheduled later
+    add(d1, 3, past, suspended=True)  # in total, out of the counts
+    add(d1, 3, past, deleted=True)  # invisible everywhere
+    add(d2, 3, past)  # another deck's due card stays on that deck
+
+    decks = {d["name"]: d for d in client.get("/api/decks").json()["decks"]}
+    assert decks["D1"]["total"] == 4
+    assert decks["D1"]["new"] == 1
+    assert decks["D1"]["due"] == 1
+    assert decks["D1"]["due_today"] == 1
+    assert decks["D2"]["total"] == 1
+    assert decks["D2"]["new"] == 0
+    assert decks["D2"]["due"] == 1
+    assert decks["D2"]["due_today"] == 1

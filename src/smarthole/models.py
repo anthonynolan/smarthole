@@ -58,7 +58,13 @@ class Deck(Document):
 class Card(Document):
     meta = {
         "collection": "cards",
-        "indexes": ["deck", "anki_guid", ("deck", "anki_nid", "anki_ord")],
+        "indexes": [
+            "deck",
+            "anki_guid",
+            ("deck", "anki_nid", "anki_ord"),
+            # Browse filter (deck + logical-delete flag).
+            ("deck", "deleted"),
+        ],
     }
 
     deck = ReferenceField(Deck, required=True)
@@ -83,7 +89,14 @@ class CardState(Document):
 
     meta = {
         "collection": "card_states",
-        "indexes": ["user", "due", {"fields": ("user", "card"), "unique": True}],
+        "indexes": [
+            "user",
+            "due",
+            {"fields": ("user", "card"), "unique": True},
+            # Browse/deck-count filters sort and page by these fields per user.
+            ("user", "due"),
+            ("user", "last_review"),
+        ],
     }
 
     user = ReferenceField(User, required=True)

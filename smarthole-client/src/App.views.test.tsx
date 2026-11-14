@@ -892,3 +892,199 @@ test('browse show-deleted lists only deleted cards with restore', async () => {
   );
   vi.unstubAllGlobals();
 });
+
+test('browse row click opens the full card detail', async () => {
+  const fetchMock = vi.fn(async (url: any) => {
+    const u = String(url);
+    const body = (v: any) => ({ ok: true, json: () => Promise.resolve(v) });
+    if (u === '/api/config') return body({ googleClientId: null });
+    if (u === '/api/me') return body({ email: 't@example.com' });
+    if (u === '/api/decks')
+      return body({
+        decks: [{ id: 'd1', name: 'Test', total: 10, due: 3, due_today: 5, new: 2 }],
+      });
+    if (u.startsWith('/api/next')) return body({ cards: [] });
+    if (u.startsWith('/api/decks/d1/cards'))
+      return body({
+        cards: [
+          {
+            card_id: 'c1',
+            front_text: 'Due Q',
+            due: '2026-11-08',
+            last_review: null,
+            state: 2,
+            reps: 1,
+            suspended: false,
+            due_today: true,
+          },
+        ],
+        total: 1,
+      });
+    if (u === '/api/cards/c1')
+      return body({
+        card_id: 'c1',
+        deck_id: 'd1',
+        deck_name: 'Test',
+        front_html: '<p>Due Q</p>',
+        back_html: '<p>Full A</p>',
+        due: '2026-11-08',
+        state: 2,
+        reps: 1,
+        meta: {
+          card_id: 'c1',
+          deck_id: 'd1',
+          deck_name: 'Test',
+          suspended: false,
+          deleted: false,
+          new_position: 1,
+          state: 2,
+          step: 0,
+          reps: 1,
+          lapses: 0,
+        },
+      });
+    throw new Error(`unexpected fetch ${u}`);
+  });
+  vi.stubGlobal('fetch', fetchMock);
+  render(<App />);
+  await waitFor(() => expect(screen.getByLabelText('menu')).toBeTruthy());
+  fireEvent.click(screen.getByLabelText('menu'));
+  fireEvent.click(screen.getAllByText('Browse')[0]);
+  await waitFor(() => expect(screen.getByText('Due Q')).toBeTruthy());
+  fireEvent.click(screen.getByText('Due Q'));
+  await waitFor(() => expect(screen.getByTestId('browse-detail')).toBeTruthy());
+  expect(
+    fetchMock.mock.calls.some(([u]) => String(u) === '/api/cards/c1'),
+  ).toBe(true);
+  expect(screen.getByTestId('browse-detail')).toHaveTextContent('Full A');
+  expect(screen.getByTestId('browse-detail')).toHaveTextContent('Card metadata');
+  vi.unstubAllGlobals();
+});
+
+test('browse detail edit updates the card', async () => {
+  let savedBack = 'Full A';
+  const fetchMock = vi.fn(async (url: any, init?: any) => {
+    const u = String(url);
+    const body = (v: any) => ({ ok: true, json: () => Promise.resolve(v) });
+    if (u === '/api/config') return body({ googleClientId: null });
+    if (u === '/api/me') return body({ email: 't@example.com' });
+    if (u === '/api/decks')
+      return body({
+        decks: [{ id: 'd1', name: 'Test', total: 10, due: 3, due_today: 5, new: 2 }],
+      });
+    if (u.startsWith('/api/next')) return body({ cards: [] });
+    if (u.startsWith('/api/decks/d1/cards'))
+      return body({
+        cards: [
+          {
+            card_id: 'c1',
+            front_text: 'Due Q',
+            due: '2026-11-08',
+            last_review: null,
+            state: 2,
+            reps: 1,
+            suspended: false,
+            due_today: true,
+          },
+        ],
+        total: 1,
+      });
+    if (u === '/api/cards/c1' && init?.method === 'PUT') {
+      const payload = JSON.parse(init.body);
+      savedBack = payload.back;
+      return body({ card_id: 'c1', deck_id: 'd1', front_html: 'Due Q', back_html: savedBack });
+    }
+    if (u === '/api/cards/c1')
+      return body({
+        card_id: 'c1',
+        deck_id: 'd1',
+        deck_name: 'Test',
+        front_html: '<p>Due Q</p>',
+        back_html: `<p>${savedBack}</p>`,
+        due: '2026-11-08',
+        state: 2,
+        reps: 1,
+        meta: null,
+      });
+    throw new Error(`unexpected fetch ${u} ${init?.method ?? 'GET'}`);
+  });
+  vi.stubGlobal('fetch', fetchMock);
+  render(<App />);
+  await waitFor(() => expect(screen.getByLabelText('menu')).toBeTruthy());
+  fireEvent.click(screen.getByLabelText('menu'));
+  fireEvent.click(screen.getAllByText('Browse')[0]);
+  await waitFor(() => expect(screen.getByText('Due Q')).toBeTruthy());
+  fireEvent.click(screen.getByText('Due Q', { selector: 'td' }));
+  await waitFor(() => expect(screen.getByTestId('browse-detail')).toBeTruthy());
+  fireEvent.click(screen.getByRole('button', { name: 'Edit' }));
+  expect(screen.getByLabelText('Question')).toHaveValue('Due Q');
+  expect(screen.getByLabelText('Answer')).toHaveValue('Full A');
+  fireEvent.change(screen.getByLabelText('Answer'), { target: { value: 'Full A2' } });
+  fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+  await waitFor(() =>
+    expect(
+      fetchMock.mock.calls.some(
+        ([u, init]) =>
+          String(u) === '/api/cards/c1' &&
+          init?.method === 'PUT' &&
+          JSON.parse(init.body).back === 'Full A2',
+      ),
+    ).toBe(true),
+  );
+  await waitFor(() =>
+    expect(screen.getByTestId('browse-detail')).toHaveTextContent('Full A2'),
+  );
+  vi.unstubAllGlobals();
+});
+
+test('browse starts from the last-used deck', async () => {
+  localStorage.setItem('smarthole.browseDeckId', 'd1');
+  try {
+    const fetchMock = vi.fn(async (url: any) => {
+      const u = String(url);
+      const body = (v: any) => ({ ok: true, json: () => Promise.resolve(v) });
+      if (u === '/api/config') return body({ googleClientId: null });
+      if (u === '/api/me') return body({ email: 't@example.com' });
+      if (u === '/api/decks')
+        return body({
+          decks: [
+            { id: 'd1', name: 'Test', total: 10, due: 3, due_today: 5, new: 2 },
+            { id: 'd2', name: 'Other', total: 1, due: 0, due_today: 0, new: 1 },
+          ],
+        });
+      if (u.startsWith('/api/next')) return body({ cards: [] });
+      if (u.startsWith('/api/decks/d1/cards'))
+        return body({
+          cards: [
+            {
+              card_id: 'c1',
+              front_text: 'Due Q',
+              due: '2026-11-08',
+              last_review: null,
+              state: 2,
+              reps: 1,
+              suspended: false,
+              due_today: true,
+            },
+          ],
+          total: 1,
+        });
+      if (u.startsWith('/api/decks/d2/cards')) return body({ cards: [], total: 0 });
+      throw new Error(`unexpected fetch ${u}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    render(<App />);
+    await waitFor(() => expect(screen.getByLabelText('menu')).toBeTruthy());
+    fireEvent.click(screen.getByLabelText('menu'));
+    fireEvent.click(screen.getAllByText('Browse')[0]);
+    await waitFor(() => expect(screen.getByText('Due Q')).toBeTruthy());
+    // The remembered deck drives the first cards request, without waiting
+    // for the deck list to pick it.
+    expect(
+      fetchMock.mock.calls.some(([u]) => String(u).startsWith('/api/decks/d1/cards')),
+    ).toBe(true);
+  } finally {
+    localStorage.removeItem('smarthole.browseDeckId');
+  }
+  vi.unstubAllGlobals();
+});

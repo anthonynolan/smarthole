@@ -7,6 +7,10 @@ import {
   Checkbox,
   CircularProgress,
   Container,
+  Dialog,
+  DialogActions,
+  DialogContent,
+  DialogTitle,
   Drawer,
   FormControl,
   FormControlLabel,
@@ -89,9 +93,11 @@ const theme = createTheme({
   },
 });
 
-/** Long-form study text: larger serif with generous leading and measure. */
+/** Long-form study text: larger serif with generous leading and measure.
+ *  Lora (loaded from Google Fonts in index.html) with a Georgia fallback
+ *  when offline. */
 const qaTextSx = {
-  fontFamily: ['Georgia', '"Times New Roman"', 'Charter', 'serif'].join(', '),
+  fontFamily: ['Lora', 'Georgia', '"Times New Roman"', 'Charter', 'serif'].join(', '),
   fontSize: '1.3rem',
   lineHeight: 1.75,
   maxWidth: '68ch',
@@ -1153,9 +1159,18 @@ function ReviewView() {
   );
 }
 
+/** Last browse deck, so the first page can load in parallel with the deck list. */
+const BROWSE_DECK_KEY = 'smarthole.browseDeckId';
+
 function BrowseView() {
   const { decks } = useDecks();
-  const [deckId, setDeckId] = useState('');
+  const [deckId, setDeckId] = useState(() => {
+    try {
+      return localStorage.getItem(BROWSE_DECK_KEY) ?? '';
+    } catch {
+      return '';
+    }
+  });
   const [rows, setRows] = useState<BrowseCard[]>([]);
   const [total, setTotal] = useState<number>(0);
   const [loading, setLoading] = useState(false);
@@ -1164,6 +1179,15 @@ function BrowseView() {
   const [showDeleted, setShowDeleted] = useState(false);
   const [rowBusy, setRowBusy] = useState<string | null>(null);
   const [rowError, setRowError] = useState<string | null>(null);
+  const [detailId, setDetailId] = useState<string | null>(null);
+  const [detail, setDetail] = useState<ReviewCard | null>(null);
+  const [detailLoading, setDetailLoading] = useState(false);
+  const [detailError, setDetailError] = useState<string | null>(null);
+  const [detailEditing, setDetailEditing] = useState(false);
+  const [detailEditFront, setDetailEditFront] = useState('');
+  const [detailEditBack, setDetailEditBack] = useState('');
+  const [detailEditBusy, setDetailEditBusy] = useState(false);
+  const [detailEditError, setDetailEditError] = useState<string | null>(null);
   const sentinelRef = useRef<HTMLDivElement | null>(null);
   const stateRef = useRef({ deckId, q: '', showDeleted: false, loading: false, total: Infinity as number });
   stateRef.current = {
@@ -1174,8 +1198,22 @@ function BrowseView() {
     total: rows.length >= total && total > 0 ? total : (Number.isFinite(stateRef.current.total) ? stateRef.current.total : Infinity),
   };
 
+  // Remember the deck so the next visit can fetch its first page in
+  // parallel with the deck list instead of waiting for it.
   useEffect(() => {
-    if (decks.length > 0 && !deckId) {
+    if (!deckId) return;
+    try {
+      localStorage.setItem(BROWSE_DECK_KEY, deckId);
+    } catch {
+      // Private-mode storage: the deck just won't be remembered.
+    }
+  }, [deckId]);
+
+  useEffect(() => {
+    // A remembered deck may be gone (deleted on another device): fall back
+    // to the first deck. The cards fetch for a stale id 404s harmlessly
+    // and is replaced once the deck id resets here.
+    if (decks.length > 0 && (!deckId || !decks.some((d) => d.id === deckId))) {
       setDeckId(decks[0].id);
     }
   }, [decks, deckId]);
@@ -1242,6 +1280,60 @@ function BrowseView() {
       setRowError(e instanceof Error ? e.message : String(e));
     } finally {
       setRowBusy(null);
+    }
+  };
+
+  // Full detail for the clicked row, loaded on demand. Deleted cards
+  // have no review payload (the endpoint 404s), so the dialog falls back
+  // to the row's own summary fields in that case.
+  const detailRow = detailId ? (rows.find((r) => r.card_id === detailId) ?? null) : null;
+  useEffect(() => {
+    if (!detailId) return;
+    let cancelled = false;
+    setDetail(null);
+    setDetailError(null);
+    setDetailEditing(false);
+    setDetailLoading(true);
+    getCard(detailId)
+      .then((c) => {
+        if (!cancelled) setDetail(c);
+      })
+      .catch(() => {
+        if (!cancelled) setDetailError('Could not load the full card detail.');
+      })
+      .finally(() => {
+        if (!cancelled) setDetailLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [detailId]);
+
+  const startDetailEdit = () => {
+    if (!detail) return;
+    setDetailEditFront(htmlToText(detail.front_html));
+    setDetailEditBack(htmlToText(detail.back_html));
+    setDetailEditError(null);
+    setDetailEditing(true);
+  };
+
+  const saveDetailEdit = async () => {
+    if (!detail || !detailId) return;
+    setDetailEditError(null);
+    if (!detailEditFront.trim() || !detailEditBack.trim()) {
+      setDetailEditError('Question and answer must be non-empty.');
+      return;
+    }
+    setDetailEditBusy(true);
+    try {
+      await updateCard(detailId, detailEditFront, detailEditBack);
+      setDetail(await getCard(detailId));
+      setDetailEditing(false);
+      await reloadBrowse();
+    } catch (e) {
+      setDetailEditError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setDetailEditBusy(false);
     }
   };
 
@@ -1418,7 +1510,11 @@ function BrowseView() {
                     </TableCell>
                   </TableRow>
                 )}
-                <TableRow>
+                <TableRow
+                  hover
+                  onClick={() => setDetailId(r.card_id)}
+                  sx={{ cursor: 'pointer' }}
+                >
                   <TableCell sx={{ textAlign: 'right' }}>{i + 1}</TableCell>
                   <TableCell sx={{ whiteSpace: 'normal', overflowWrap: 'break-word' }}>
                     {r.front_text}
@@ -1431,7 +1527,10 @@ function BrowseView() {
                         <Button
                           size="small"
                           variant="outlined"
-                          onClick={() => handleRestore(r.card_id)}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            void handleRestore(r.card_id);
+                          }}
                           disabled={rowBusy === r.card_id}
                         >
                           Restore
@@ -1440,7 +1539,10 @@ function BrowseView() {
                           size="small"
                           variant="outlined"
                           color="error"
-                          onClick={() => handlePermanentDelete(r.card_id)}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            void handlePermanentDelete(r.card_id);
+                          }}
                           disabled={rowBusy === r.card_id}
                         >
                           Delete forever
@@ -1460,6 +1562,94 @@ function BrowseView() {
         </Box>
       )}
       <div ref={sentinelRef} aria-hidden style={{ height: 1 }} />
+      <Dialog
+        open={detailId !== null}
+        onClose={() => setDetailId(null)}
+        maxWidth="md"
+        fullWidth
+      >
+        <DialogTitle>Card detail</DialogTitle>
+        <DialogContent dividers data-testid="browse-detail">
+          {detailLoading && (
+            <Box sx={{ textAlign: 'center', py: 2 }}>
+              <CircularProgress size={20} aria-label="loading card detail" />
+            </Box>
+          )}
+          {detailError && !detail && (
+            <Alert severity="warning" sx={{ mb: 2 }}>
+              {detailError}
+            </Alert>
+          )}
+          {detail ? (
+            detailEditing ? (
+              <>
+                <TextField
+                  label="Question"
+                  multiline
+                  fullWidth
+                  minRows={2}
+                  value={detailEditFront}
+                  onChange={(e) => setDetailEditFront(e.target.value)}
+                  disabled={detailEditBusy}
+                  sx={{ mb: 2 }}
+                />
+                <TextField
+                  label="Answer"
+                  multiline
+                  fullWidth
+                  minRows={4}
+                  value={detailEditBack}
+                  onChange={(e) => setDetailEditBack(e.target.value)}
+                  disabled={detailEditBusy}
+                />
+                {detailEditError && (
+                  <Alert severity="error" sx={{ mt: 1 }}>
+                    {detailEditError}
+                  </Alert>
+                )}
+              </>
+            ) : (
+              <>
+                <Box sx={qaTextSx} dangerouslySetInnerHTML={{ __html: detail.front_html }} />
+                <Box
+                  sx={{ ...qaTextSx, mt: 2, pt: 2, borderTop: '1px dashed #aaa' }}
+                  dangerouslySetInnerHTML={{ __html: detail.back_html }}
+                />
+                <CardMetaView meta={detail.meta} card={detail} />
+              </>
+            )
+          ) : (
+            !detailLoading &&
+            detailRow && (
+              <>
+                <Box sx={qaTextSx}>{detailRow.front_text}</Box>
+                <Typography variant="body2" color="text.secondary" sx={{ mt: 1 }}>
+                  Due {fmtDate(detailRow.due)} · Last reviewed{' '}
+                  {fmtDate(detailRow.last_review)}
+                </Typography>
+              </>
+            )
+          )}
+        </DialogContent>
+        <DialogActions>
+          {detail && !detailEditing && <Button onClick={startDetailEdit}>Edit</Button>}
+          {detailEditing && (
+            <>
+              <Button onClick={() => setDetailEditing(false)} disabled={detailEditBusy}>
+                Cancel
+              </Button>
+              <Button
+                variant="contained"
+                onClick={() => void saveDetailEdit()}
+                disabled={detailEditBusy}
+              >
+                Save
+              </Button>
+            </>
+          )}
+          <Button onClick={() => setDetailId(null)}>Close</Button>
+        </DialogActions>
+      </Dialog>
     </Box>
   );
 }
