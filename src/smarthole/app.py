@@ -6,6 +6,7 @@ import logging
 import mimetypes
 import os
 import re
+import shutil
 import tempfile
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
@@ -662,7 +663,7 @@ def create_app() -> FastAPI:
                 status.HTTP_400_BAD_REQUEST, "Upload a .apkg or .colpkg file"
             )
         with tempfile.NamedTemporaryFile(suffix=".apkg", delete=False) as tmp:
-            tmp.write(file.file.read())
+            shutil.copyfileobj(file.file, tmp)
             tmp_path = tmp.name
 
         def run_save(result):
