@@ -30,6 +30,7 @@ from .mcp_auth import (
     MCP_SCOPES,
     SmartholeTokenVerifier,
 )
+from .mcp_card_widget import WIDGET_MIME, WIDGET_URI, get_card_widget_html
 from .models import Card, CardState, Deck, User
 
 __all__ = ["mcp", "create_mcp_server", "MCP_SCOPES"]
@@ -42,6 +43,22 @@ class CreateCardResult(TypedDict):
     deck_id: str
 
 
+class CardProposalResult(TypedDict):
+    """Structured result for propose_cards: deck plus proposed front/back pairs."""
+
+    deck_id: str
+    deck_name: str
+    cards: list[dict]
+
+
+class CreateCardsResult(TypedDict):
+    """Structured result for create_cards: ids of the new cards and their deck."""
+
+    deck_id: str
+    created_card_ids: list[str]
+    count: int
+
+
 logger = logging.getLogger(__name__)
 
 MCP_RESOURCE_URL = os.getenv(
@@ -52,7 +69,12 @@ MCP_STATELESS = os.getenv("MCP_STATELESS", "0") == "1"
 
 MCP_INSTRUCTIONS = """Use smarthole tools for the authenticated user's Anki
 decks. To add cards: call list_decks first so you use a real deck_id (and the
-exact deck name the user asked for), then call create_card once per card.
+exact deck name the user asked for), then call propose_cards exactly once
+with the complete final list before finishing your response. propose_cards
+renders the selectable card UI (checkboxes + select-all); the widget calls
+create_cards with only the ticked boxes, so cards are never created in the
+background. Never provide card additions as text alone and never call
+create_card(s) directly to bypass the checkbox verification.
 Keep front/back short plain text or simple HTML; do not invent deck ids."""
 
 
@@ -124,8 +146,41 @@ def list_decks() -> list[dict]:
     return _call_service("list_decks", _list, user_email)
 
 
+def _persist_card(user, deck, front: str, back: str) -> Card:
+    """Create one MCP-sourced card + fresh FSRS state (no validation)."""
+    existing = Card.objects(deck=deck).only("new_position")
+    new_position = max((c.new_position or 0 for c in existing), default=0) + 1
+    card = Card(
+        deck=deck,
+        front_html=apkg_import.sanitize(front),
+        back_html=apkg_import.sanitize(back),
+        new_position=new_position,
+        created_via_mcp=True,
+    ).save()
+    CardState(
+        user=user,
+        card=card,
+        new_position=new_position,
+        **fsrs_service.fresh_state(),
+    ).save()
+    return card
+
+
+def _resolve_deck(user, deck_id: str) -> Deck:
+    try:
+        deck = Deck.objects(owner=user, id=deck_id).first()
+    except Exception:
+        deck = None
+    if deck is None:
+        raise ToolError("Deck not found")
+    return deck
+
+
 def create_card(deck_id: str, front: str, back: str) -> CreateCardResult:
-    """Create one Anki card in the caller's deck.
+    """Create one Anki card in the caller's deck (direct write, no widget).
+
+    Prefer propose_cards so the user verifies with checkboxes; this stays
+    for backwards compatibility and still flags the card as MCP-created.
 
     Args:
         deck_id: Deck id from list_decks (required).
@@ -139,37 +194,114 @@ def create_card(deck_id: str, front: str, back: str) -> CreateCardResult:
         if not (front or "").strip() or not (back or "").strip():
             raise ToolError("front and back must be non-empty")
         user = _get_user(email)
-        try:
-            deck = Deck.objects(owner=user, id=deck_id).first()
-        except Exception:
-            deck = None
-        if deck is None:
-            raise ToolError("Deck not found")
-        existing = Card.objects(deck=deck).only("new_position")
-        new_position = max((c.new_position or 0 for c in existing), default=0) + 1
-        card = Card(
-            deck=deck,
-            front_html=apkg_import.sanitize(front),
-            back_html=apkg_import.sanitize(back),
-            new_position=new_position,
-        ).save()
-        CardState(
-            user=user,
-            card=card,
-            new_position=new_position,
-            **fsrs_service.fresh_state(),
-        ).save()
+        deck = _resolve_deck(user, deck_id)
+        card = _persist_card(user, deck, front, back)
         return {"card_id": str(card.id), "deck_id": str(deck.id)}
 
     return _call_service("create_card", _create, user_email)
 
 
-_MCP_TOOLS = (list_decks, create_card)
+def propose_cards(deck_id: str, cards: list[dict]) -> CardProposalResult:
+    """Present the FINAL card list as a selectable widget (call once).
 
+    After deciding the cards but before finishing your response, call this
+    with the complete final list. This call renders the checkbox widget
+    (with select-all), so its cards must exactly match the final proposal.
+    Nothing is written: the widget calls create_cards with the ticked
+    boxes. Do not call it for drafts; gather context with list_decks.
+
+    Args:
+        deck_id: Deck id from list_decks (required).
+        cards: Proposed cards, each {"front": "...", "back": "..."}
+            (required, non-empty; plain text or simple HTML).
+    """
+    user_email = _require_auth(CARDS_WRITE_SCOPE)
+    logger.info(
+        "MCP propose_cards called with %d cards", len(cards or [])
+    )
+
+    def _propose(email: str) -> dict:
+        if not cards:
+            raise ToolError("cards must be a non-empty list")
+        user = _get_user(email)
+        deck = _resolve_deck(user, deck_id)
+        cleaned: list[dict] = []
+        for entry in cards:
+            front = (entry.get("front") or "") if isinstance(entry, dict) else ""
+            back = (entry.get("back") or "") if isinstance(entry, dict) else ""
+            if not front.strip() or not back.strip():
+                raise ToolError("every card front and back must be non-empty")
+            cleaned.append({"front": front, "back": back})
+        return {
+            "deck_id": str(deck.id),
+            "deck_name": deck.name,
+            "cards": cleaned,
+        }
+
+    return _call_service("propose_cards", _propose, user_email)
+
+
+def create_cards(deck_id: str, cards: list[dict]) -> CreateCardsResult:
+    """Create the user-selected cards from propose_cards.
+
+    The widget behind propose_cards calls this with the ticked boxes.
+    Each entry is {"front": "...", "back": "..."}; empty entries are
+    rejected and nothing is created for them.
+
+    Args:
+        deck_id: Deck id from list_decks (required).
+        cards: Selected entries from propose_cards.
+    """
+    user_email = _require_auth(CARDS_WRITE_SCOPE)
+    logger.info(
+        "MCP create_cards called with %d cards", len(cards or [])
+    )
+
+    def _create_many(email: str) -> dict:
+        if not cards:
+            raise ToolError("cards must be a non-empty list")
+        user = _get_user(email)
+        deck = _resolve_deck(user, deck_id)
+        ids: list[str] = []
+        for entry in cards:
+            front = (entry.get("front") or "") if isinstance(entry, dict) else ""
+            back = (entry.get("back") or "") if isinstance(entry, dict) else ""
+            if not front.strip() or not back.strip():
+                raise ToolError("every card front and back must be non-empty")
+            ids.append(str(_persist_card(user, deck, front, back).id))
+        return {
+            "deck_id": str(deck.id),
+            "created_card_ids": ids,
+            "count": len(ids),
+        }
+
+    return _call_service("create_cards", _create_many, user_email)
+
+
+def card_proposal_widget() -> str:
+    """Selectable card-proposal widget (select-all + add to its deck)."""
+    return get_card_widget_html()
+
+
+_MCP_TOOLS = (list_decks, create_card, propose_cards, create_cards)
+
+_CARD_WIDGET_META = {
+    "ui": {
+        "resourceUri": WIDGET_URI,
+        "visibility": ["model", "app"],
+    },
+    "openai/outputTemplate": WIDGET_URI,
+    "openai/toolInvocation/invoking": "Preparing your card suggestions…",
+    "openai/toolInvocation/invoked": "Card suggestions ready",
+}
 _MCP_TOOL_META: dict[str, dict] = {
     "create_card": {
         "openai/toolInvocation/invoking": "Adding your Anki card…",
         "openai/toolInvocation/invoked": "Card added",
+    },
+    "propose_cards": _CARD_WIDGET_META,
+    "create_cards": {
+        "ui": {"visibility": ["model", "app"]},
     },
 }
 
@@ -198,6 +330,11 @@ def create_mcp_server() -> FastMCP:
             server.tool(meta=meta)(func)
         else:
             server.tool()(func)
+    server.resource(
+        WIDGET_URI,
+        mime_type=WIDGET_MIME,
+        meta={"ui": {"prefersBorder": True}},
+    )(card_proposal_widget)
     return server
 
 

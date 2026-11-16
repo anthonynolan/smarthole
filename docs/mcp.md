@@ -18,11 +18,19 @@ connectors / Apps, MCP Inspector, Claude Code, Cursor, …). Pattern mirrors
 | Tool | Source | Scope |
 |---|---|---|
 | `list_decks()` | caller's decks with card counts | `cards:read` |
-| `create_card(deck_id, front, back)` | create one card (FSRS-new) in a deck | `cards:write` |
+| `propose_cards(deck_id, cards)` | propose final cards, renders checkbox widget (no writes) | `cards:write` |
+| `create_cards(deck_id, cards)` | create the widget's ticked boxes (FSRS-new, flagged MCP-created) | `cards:write` |
+| `create_card(deck_id, front, back)` | legacy direct create (no widget); prefer `propose_cards` | `cards:write` |
 
-Tools share the same code path as the REST routes (`POST /api/cards`):
-front/back are sanitized the same way and the card starts in the same
-fresh FSRS state. The caller's identity always comes from the verified
+Card creation mirrors the grimoire workout flow: `propose_cards` renders
+the selectable widget (checkboxes + select-all) at its call position and
+the widget calls `create_cards` with only the ticked boxes, so cards are
+never created in the background. Tools share the same code path as the
+REST routes (`POST /api/cards`): front/back are sanitized the same way
+and the card starts in the same fresh FSRS state. MCP-created cards are
+flagged (`created_via_mcp`) and can be listed in Browse with the
+"Show MCP-created" checkbox (`?mcp_only=true`), parallel to
+"Show deleted". The caller's identity always comes from the verified
 Bearer token (`get_access_token().subject` = smarthole email); tools take
 no user id. Service errors become MCP `ToolError` so clients can tell
 "not found" from failures.

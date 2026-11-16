@@ -1177,6 +1177,7 @@ function BrowseView() {
   const [q, setQ] = useState('');
   const [committedQ, setCommittedQ] = useState('');
   const [showDeleted, setShowDeleted] = useState(false);
+  const [showMcpOnly, setShowMcpOnly] = useState(false);
   const [rowBusy, setRowBusy] = useState<string | null>(null);
   const [rowError, setRowError] = useState<string | null>(null);
   const [detailId, setDetailId] = useState<string | null>(null);
@@ -1189,11 +1190,12 @@ function BrowseView() {
   const [detailEditBusy, setDetailEditBusy] = useState(false);
   const [detailEditError, setDetailEditError] = useState<string | null>(null);
   const sentinelRef = useRef<HTMLDivElement | null>(null);
-  const stateRef = useRef({ deckId, q: '', showDeleted: false, loading: false, total: Infinity as number });
+  const stateRef = useRef({ deckId, q: '', showDeleted: false, showMcpOnly: false, loading: false, total: Infinity as number });
   stateRef.current = {
     deckId,
     q: committedQ,
     showDeleted,
+    showMcpOnly,
     loading,
     total: rows.length >= total && total > 0 ? total : (Number.isFinite(stateRef.current.total) ? stateRef.current.total : Infinity),
   };
@@ -1234,7 +1236,7 @@ function BrowseView() {
     let cancelled = false;
     setLoading(true);
     setRowError(null);
-    browseCards(deckId, 'due', 'asc', 0, BROWSE_PAGE, committedQ, showDeleted)
+    browseCards(deckId, 'due', 'asc', 0, BROWSE_PAGE, committedQ, showDeleted, showMcpOnly)
       .then(({ cards, total: t }) => {
         if (cancelled) return;
         setRows(cards);
@@ -1253,7 +1255,7 @@ function BrowseView() {
     return () => {
       cancelled = true;
     };
-  }, [deckId, committedQ, showDeleted]);
+  }, [deckId, committedQ, showDeleted, showMcpOnly]);
 
   const reloadBrowse = useCallback(async () => {
     if (!deckId) return;
@@ -1261,14 +1263,14 @@ function BrowseView() {
     setRowError(null);
     try {
       const { cards, total: t } = await browseCards(
-        deckId, 'due', 'asc', 0, BROWSE_PAGE, committedQ, showDeleted,
+        deckId, 'due', 'asc', 0, BROWSE_PAGE, committedQ, showDeleted, showMcpOnly,
       );
       setRows(cards);
       setTotal(t);
     } finally {
       setLoading(false);
     }
-  }, [deckId, committedQ, showDeleted]);
+  }, [deckId, committedQ, showDeleted, showMcpOnly]);
 
   const handleRestore = async (cardId: string) => {
     setRowError(null);
@@ -1372,6 +1374,7 @@ function BrowseView() {
           BROWSE_PAGE,
           s.q,
           s.showDeleted,
+          s.showMcpOnly,
         );
         if (stopped) return;
         setRows((prev) => [...prev, ...cards]);
@@ -1468,10 +1471,25 @@ function BrowseView() {
         }
         label="Show deleted"
       />
+      <FormControlLabel
+        control={
+          <Checkbox
+            checked={showMcpOnly}
+            onChange={(e) => setShowMcpOnly(e.target.checked)}
+          />
+        }
+        label="Show MCP-created"
+      />
       {showDeleted && (
         <Typography variant="body2" color="text.secondary" sx={{ mb: 1 }}>
           Deleted cards only — restore one, or permanently delete it (schedule
           and review history are removed only by permanent deletion).
+        </Typography>
+      )}
+      {showMcpOnly && (
+        <Typography variant="body2" color="text.secondary" sx={{ mb: 1 }}>
+          MCP-created cards only — cards added via the MCP call, verified with
+          checkboxes before creation.
         </Typography>
       )}
       {rowError && (

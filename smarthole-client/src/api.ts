@@ -364,6 +364,7 @@ export interface BrowseCard {
   reps: number;
   suspended: boolean;
   deleted?: boolean;
+  created_via_mcp?: boolean;
   /** True when the card counts as due today (drives the divider line). */
   due_today: boolean;
 }
@@ -378,11 +379,13 @@ export async function browseCards(
   limit: number = BROWSE_PAGE,
   search?: string,
   showDeleted = false,
+  mcpOnly = false,
 ): Promise<{ cards: BrowseCard[]; total: number }> {
   let q =
     `?sort=${sort}&direction=${direction}&skip=${skip}&limit=${limit}`;
   if (search) q += `&q=${encodeURIComponent(search)}`;
   if (showDeleted) q += '&show_deleted=true';
+  if (mcpOnly) q += '&mcp_only=true';
   const res = await apiFetch(`/decks/${encodeURIComponent(deckId)}/cards${q}`);
   return readJson(res);
 }

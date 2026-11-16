@@ -64,6 +64,8 @@ class Card(Document):
             ("deck", "anki_nid", "anki_ord"),
             # Browse filter (deck + logical-delete flag).
             ("deck", "deleted"),
+            # Browse filter for MCP-created cards.
+            ("deck", "created_via_mcp"),
         ],
     }
 
@@ -78,6 +80,7 @@ class Card(Document):
     created_at = DateTimeField(default=utcnow)
     deleted = BooleanField(default=False)  # logical delete; hard delete purges
     deleted_at = DateTimeField()
+    created_via_mcp = BooleanField(default=False)  # True for MCP-created cards
     # OpenAI embedding for similarity search (Atlas vector index
     # 'card_embedding_index' on this path; also the basis for DB chat).
     embedding = ListField(FloatField(), default=list)

@@ -102,7 +102,94 @@ def test_mcp_endpoint_requires_bearer(client):
 
 def test_mcp_tools_registered():
     names = {t.name for t in mcp_server.mcp._tool_manager.list_tools()}
-    assert {"list_decks", "create_card"} <= names
+    assert {"list_decks", "create_card", "propose_cards", "create_cards"} <= names
+
+
+def test_mcp_propose_then_create_roundtrip(client):
+    """Checkbox flow: propose writes nothing, create_cards writes flagged cards."""
+    user = User.objects(email=USER_EMAIL).first()
+    deck = Deck(owner=user, name="Propose Deck").save()
+    token = _bearer()
+    session = _init_session(client, token)
+
+    before = Card.objects(deck=deck).count()
+    proposed, _ = _mcp_rpc(
+        client,
+        {
+            "jsonrpc": "2.0",
+            "id": 10,
+            "method": "tools/call",
+            "params": {
+                "name": "propose_cards",
+                "arguments": {
+                    "deck_id": str(deck.id),
+                    "cards": [
+                        {"front": "P front 1", "back": "P back 1"},
+                        {"front": "P front 2", "back": "P back 2"},
+                    ],
+                },
+            },
+        },
+        token,
+        session,
+    )
+    assert proposed["result"]["structuredContent"]["deck_id"] == str(deck.id)
+    assert len(proposed["result"]["structuredContent"]["cards"]) == 2
+    # Proposal alone creates nothing (widget confirmation still pending).
+    assert Card.objects(deck=deck).count() == before
+
+    created, _ = _mcp_rpc(
+        client,
+        {
+            "jsonrpc": "2.0",
+            "id": 11,
+            "method": "tools/call",
+            "params": {
+                "name": "create_cards",
+                "arguments": {
+                    "deck_id": str(deck.id),
+                    "cards": [{"front": "P front 1", "back": "P back 1"}],
+                },
+            },
+        },
+        token,
+        session,
+    )
+    content = created["result"]["structuredContent"]
+    assert content["count"] == 1
+    card = Card.objects(id=content["created_card_ids"][0]).first()
+    assert card is not None
+    assert card.created_via_mcp is True
+    assert "P front 1" in card.front_html
+
+
+def test_mcp_create_flags_card_for_browse_filter(client):
+    """Direct MCP creates are flagged so Browse's MCP checkbox finds them."""
+    user = User.objects(email=USER_EMAIL).first()
+    deck = Deck(owner=user, name="Flag Deck").save()
+    token = _bearer()
+    session = _init_session(client, token)
+
+    created_body, _ = _mcp_rpc(
+        client,
+        {
+            "jsonrpc": "2.0",
+            "id": 12,
+            "method": "tools/call",
+            "params": {
+                "name": "create_card",
+                "arguments": {
+                    "deck_id": str(deck.id),
+                    "front": "flag me",
+                    "back": "flag back",
+                },
+            },
+        },
+        token,
+        session,
+    )
+    card_id = created_body["result"]["structuredContent"]["card_id"]
+    assert Card.objects(id=card_id).first().created_via_mcp is True
 
 
 def test_mcp_list_and_create_roundtrip(client):

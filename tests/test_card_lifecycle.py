@@ -146,6 +146,32 @@ def test_delete_is_logical_and_browse_hides_it(client):
     assert client.get(f"/api/decks/{deck.id}/cards").json()["total"] == 1
 
 
+def test_browse_mcp_only_shows_only_mcp_cards(client):
+    from smarthole import fsrs_service
+    from smarthole.models import Card, CardState
+
+    register(client)
+    deck, manual_id = _make_card(client, front="manual Q")
+    user = deck.owner
+    mcp_card = Card(
+        deck=deck,
+        front_html="mcp Q",
+        back_html="mcp A",
+        new_position=99,
+        created_via_mcp=True,
+    ).save()
+    CardState(user=user, card=mcp_card, new_position=99, **fsrs_service.fresh_state()).save()
+
+    assert Card.objects(id=manual_id).first().created_via_mcp is not True
+
+    all_rows = client.get(f"/api/decks/{deck.id}/cards?limit=100").json()
+    assert all_rows["total"] == 2
+    mcp_rows = client.get(f"/api/decks/{deck.id}/cards?limit=100&mcp_only=true").json()
+    assert mcp_rows["total"] == 1
+    assert mcp_rows["cards"][0]["card_id"] == str(mcp_card.id)
+    assert mcp_rows["cards"][0]["created_via_mcp"] is True
+
+
 def test_permanent_delete_purges_schedule_and_reviews(client):
     from smarthole.models import Card, CardState, Review
 

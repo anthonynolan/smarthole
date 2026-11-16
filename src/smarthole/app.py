@@ -387,6 +387,7 @@ def create_app() -> FastAPI:
         limit: int = Query(default=20, ge=1, le=100),
         q: str | None = Query(default=None),
         show_deleted: bool = Query(default=False),
+        mcp_only: bool = Query(default=False),
         user: User = Depends(get_current_user),
     ):
         deck = Deck.objects(owner=user, id=deck_id).first()
@@ -399,6 +400,11 @@ def create_app() -> FastAPI:
             cards_query = Card.objects(deck=deck, deleted=True)
         else:
             cards_query = Card.objects(deck=deck, deleted__ne=True)
+        # MCP filter shows *only* cards created via the MCP call, parallel
+        # to show_deleted. Pre-migration cards lacking the flag read as
+        # False, so they are excluded when the filter is on.
+        if mcp_only:
+            cards_query = cards_query.filter(created_via_mcp=True)
         if q and q.strip():
             needle = q.strip()
             cards_query = cards_query.filter(
@@ -439,6 +445,7 @@ def create_app() -> FastAPI:
                     "reps": s.reps,
                     "suspended": card.suspended,
                     "deleted": bool(card.deleted),
+                    "created_via_mcp": bool(getattr(card, "created_via_mcp", False)),
                     "due_today": (
                         s.reps > 0
                         and not card.suspended
@@ -468,6 +475,7 @@ def create_app() -> FastAPI:
             front_html=apkg_import.render_plain_text(body.front),
             back_html=apkg_import.render_plain_text(body.back),
             new_position=new_position,
+            created_via_mcp=False,
         ).save()
         # Best-effort: a missing key or API failure just leaves the card
         # unembedded until the backfill script runs.
