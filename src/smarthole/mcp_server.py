@@ -68,12 +68,17 @@ MCP_ISSUER_URL = os.getenv("MCP_ISSUER_URL", "https://smarthole.cathalanddad.com
 MCP_STATELESS = os.getenv("MCP_STATELESS", "0") == "1"
 
 MCP_INSTRUCTIONS = """Use smarthole tools for the authenticated user's Anki
-decks. To add cards: call list_decks first so you use a real deck_id (and the
-exact deck name the user asked for), then call propose_cards exactly once
-with the complete final list before finishing your response. propose_cards
-renders the selectable card UI (checkboxes + select-all); the widget calls
-create_cards with only the ticked boxes, so cards are never created in the
-background. Never provide card additions as text alone and never call
+decks. For every request to add cards, follow this complete workflow without
+exception:
+1. Call list_decks first so you use a real deck_id (and the exact deck name
+   the user asked for).
+2. Decide the final card list.
+3. Call propose_cards exactly once with that final list before finishing
+   your response. Never provide card additions as text alone;
+   propose_cards is required because it renders the selectable card UI
+   (checkboxes + select-all). The widget calls create_cards with only the
+   ticked boxes, so cards are never created in the background.
+Do not call propose_cards for drafts or partial lists. Never call
 create_card(s) directly to bypass the checkbox verification.
 Keep front/back short plain text or simple HTML; do not invent deck ids."""
 

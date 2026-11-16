@@ -163,6 +163,19 @@ def test_mcp_propose_then_create_roundtrip(client):
     assert "P front 1" in card.front_html
 
 
+def test_mcp_propose_widget_contract():
+    """Lock the exact contract ChatGPT needs to render the confirm widget."""
+    assert "propose_cards" in mcp_server.MCP_INSTRUCTIONS
+    meta = mcp_server._MCP_TOOL_META["propose_cards"]
+    assert meta["openai/outputTemplate"] == mcp_server.WIDGET_URI
+    assert meta["ui"]["resourceUri"] == mcp_server.WIDGET_URI
+    uris = [str(r.uri) for r in mcp_server.mcp._resource_manager.list_resources()]
+    assert mcp_server.WIDGET_URI in uris
+    html = mcp_server.get_card_widget_html()
+    assert 'type="checkbox"' in html and "selectAll" in html
+    assert "create_cards" in html
+
+
 def test_mcp_create_flags_card_for_browse_filter(client):
     """Direct MCP creates are flagged so Browse's MCP checkbox finds them."""
     user = User.objects(email=USER_EMAIL).first()
