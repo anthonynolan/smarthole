@@ -15,8 +15,8 @@ separate database) + py-fsrs.
   previews the next-due interval, and the review screen shows how many
   cards are due today.
 - FSRS scheduling (`desired_retention=0.9`, learning steps 1m/10m, 10m
-  relearning, fuzzing on) with a single wave of due cards per day — a card
-  graded today never comes due again until tomorrow.
+  relearning, fuzzing on); learning steps come due intraday like Anki, so
+  each grade button previews its own distinct period.
 - Anki-style daily limit of 20 new cards per day, in Anki new-order
   (tune with `NEW_CARDS_PER_DAY`).
 - Add cards, and edit cards with formatting preserved: line breaks survive
@@ -102,8 +102,8 @@ cd smarthole-client && npm run dev   # proxied /api -> localhost:8123
 
 Grades drive the FSRS scheduler (`fsrs` package, default parameters,
 `desired_retention=0.9`, learning steps 1m/10m, 10m relearning, fuzzing on).
-Intraday steps are clamped to the start of the next day, so there is only
-ever one wave of due cards per day.
+Learning and relearning steps keep their intraday due times, so a card
+graded today can come due again later the same day.
 
 Imports keep your Anki schedule when the file has one: review intervals stand
 in for stability, ease maps to difficulty, and due dates anchor on your last

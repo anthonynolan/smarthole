@@ -1,4 +1,4 @@
-"""Card lifecycle: formatting round-trip, logical/permanent delete, FSRS waves."""
+"""Card lifecycle: formatting round-trip, logical/permanent delete, FSRS steps."""
 
 import os
 
@@ -189,8 +189,8 @@ def test_permanent_delete_purges_schedule_and_reviews(client):
     assert Review.objects(card=card).count() == 0
 
 
-def test_single_wave_per_day(client):
-    """Grading never leaves a card due again the same day."""
+def test_learning_steps_come_due_intraday(client):
+    """Grading a new card keeps FSRS intraday steps with distinct dues."""
     from datetime import UTC, datetime, timedelta
 
     from smarthole import fsrs_service
@@ -198,8 +198,15 @@ def test_single_wave_per_day(client):
 
     now = datetime.now(UTC)
     tomorrow = now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+    dues = {}
     for rating in (1, 2, 3, 4):
         updated = fsrs_service.apply_rating(
             fsrs_service.fresh_state(now=now), rating, now=now
         )
-        assert ensure_aware(updated["due"]) >= tomorrow, rating
+        dues[rating] = ensure_aware(updated["due"])
+    # Again/Hard/Good stay intraday; Easy graduates to days out.
+    for rating in (1, 2, 3):
+        assert dues[rating] is not None and dues[rating] < tomorrow, rating
+    assert dues[4] is not None and dues[4] >= tomorrow
+    # Each difficulty previews its own period.
+    assert dues[1] < dues[2] < dues[3] < dues[4]

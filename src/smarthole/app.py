@@ -52,6 +52,8 @@ from .auth import (
     verify_password,
 )
 from .models import Card, CardState, Deck, Media, Review, User
+from .models import ensure_card_number as _ensure_card_number
+from .models import next_card_number as _next_card_number
 
 STATIC_DIR = Path(__file__).parent / "static"
 CLIENT_DIST = Path(__file__).resolve().parents[2] / "smarthole-client" / "dist"
@@ -75,6 +77,10 @@ class CardBody(BaseModel):
 class CardUpdateBody(BaseModel):
     front: str
     back: str
+
+
+class DueBody(BaseModel):
+    due: str
 
 
 class AiReviewBody(BaseModel):
@@ -388,6 +394,7 @@ def create_app() -> FastAPI:
         q: str | None = Query(default=None),
         show_deleted: bool = Query(default=False),
         mcp_only: bool = Query(default=False),
+        suspended_only: bool = Query(default=False),
         user: User = Depends(get_current_user),
     ):
         deck = Deck.objects(owner=user, id=deck_id).first()
@@ -400,11 +407,13 @@ def create_app() -> FastAPI:
             cards_query = Card.objects(deck=deck, deleted=True)
         else:
             cards_query = Card.objects(deck=deck, deleted__ne=True)
-        # MCP filter shows *only* cards created via the MCP call, parallel
-        # to show_deleted. Pre-migration cards lacking the flag read as
+        # MCP / suspended filters show *only* matching cards, parallel to
+        # show_deleted. Pre-migration cards lacking the flags read as
         # False, so they are excluded when the filter is on.
         if mcp_only:
             cards_query = cards_query.filter(created_via_mcp=True)
+        if suspended_only:
+            cards_query = cards_query.filter(suspended=True)
         if q and q.strip():
             needle = q.strip()
             cards_query = cards_query.filter(
@@ -430,31 +439,92 @@ def create_app() -> FastAPI:
                 continue
             cards[card.id] = card
         tomorrow = _day_start() + timedelta(days=1)
+
+        def _row_for(state, card):
+            try:
+                number = card.card_number or _ensure_card_number(card)
+            except Exception:
+                number = getattr(card, "card_number", None)
+            return {
+                "card_id": str(card.id),
+                "card_number": number,
+                "front_text": plain_text(card.front_html),
+                "due": state.due.isoformat() if state.due else None,
+                "last_review": state.last_review.isoformat()
+                if state.last_review
+                else None,
+                "created_at": card.created_at.isoformat()
+                if getattr(card, "created_at", None)
+                else None,
+                "state": state.state,
+                "reps": state.reps,
+                "suspended": card.suspended,
+                "deleted": bool(card.deleted),
+                "created_via_mcp": bool(getattr(card, "created_via_mcp", False)),
+                "due_today": (
+                    state.reps > 0
+                    and not card.suspended
+                    and state.due is not None
+                    and fsrs_service.ensure_aware(state.due) < tomorrow
+                ),
+            }
+
         rows = []
         for s in states:
             card = cards.get(s.card.id)
             if card is None:
                 continue
-            rows.append(
-                {
-                    "card_id": str(card.id),
-                    "front_text": plain_text(card.front_html),
-                    "due": s.due.isoformat() if s.due else None,
-                    "last_review": s.last_review.isoformat() if s.last_review else None,
-                    "state": s.state,
-                    "reps": s.reps,
-                    "suspended": card.suspended,
-                    "deleted": bool(card.deleted),
-                    "created_via_mcp": bool(getattr(card, "created_via_mcp", False)),
-                    "due_today": (
-                        s.reps > 0
-                        and not card.suspended
-                        and s.due is not None
-                        and fsrs_service.ensure_aware(s.due) < tomorrow
-                    ),
-                }
-            )
-        return {"cards": rows, "total": total}
+            rows.append(_row_for(s, card))
+        extra_similar = 0
+        # Embedding-similarity supplement: exact substring matches come
+        # first (due-sorted above); close vector matches are appended on the
+        # first page only, so later pages stay stable. Skipped when the
+        # deleted/suspended/MCP filters narrow the view, and degrades to
+        # exact-only when embeddings are unavailable.
+        needle = (q or "").strip()
+        if (
+            needle
+            and skip == 0
+            and not show_deleted
+            and not mcp_only
+            and not suspended_only
+        ):
+            try:
+                query_vector, _ = embeddings.embed_text(
+                    embeddings.card_embedding_text(needle, "")
+                )
+                similar = embeddings.similar_cards(
+                    Card._get_collection(),
+                    query_vector,
+                    deck_ids=[deck.id],
+                    limit=20,
+                    min_score=_related_min_score(),
+                )
+                exact_ids = {str(i) for i in card_ids}
+                seen = {r["card_id"] for r in rows} | exact_ids
+                for hit in similar:
+                    hid = str(hit["_id"])
+                    if hid in exact_ids or hid in seen:
+                        continue
+                    seen.add(hid)
+                    state = CardState.objects(user=user, card=hid).first()
+                    if state is None:
+                        continue
+                    try:
+                        card = state.card
+                    except Exception:
+                        continue
+                    if (
+                        card is None
+                        or card.deleted
+                        or str(card.deck.id) != str(deck.id)
+                    ):
+                        continue
+                    rows.append(_row_for(state, card))
+                    extra_similar += 1
+            except Exception as exc:
+                logger.warning("browse similarity search unavailable: %s", exc)
+        return {"cards": rows, "total": total + extra_similar}
 
     @app.post("/api/cards", status_code=201)
     def create_card(body: CardBody, user: User = Depends(get_current_user)):
@@ -472,6 +542,7 @@ def create_app() -> FastAPI:
         new_position = max((c.new_position or 0 for c in existing), default=0) + 1
         card = Card(
             deck=deck,
+            card_number=_next_card_number(),
             front_html=apkg_import.render_plain_text(body.front),
             back_html=apkg_import.render_plain_text(body.back),
             new_position=new_position,
@@ -668,6 +739,58 @@ def create_app() -> FastAPI:
             card.update(set__deleted=False, unset__deleted_at=True)
         return {"restored": card_id}
 
+    @app.post("/api/cards/{card_id}/suspend")
+    def suspend_card(card_id: str, user: User = Depends(get_current_user)):
+        """Suspend a card: it stays in Browse but leaves the review queue."""
+        try:
+            card = Card.objects(id=card_id).first()
+        except Exception:
+            card = None
+        if card is None or card.deck.owner.id != user.id or card.deleted:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Card not found")
+        if not card.suspended:
+            card.update(set__suspended=True)
+        return {"suspended": card_id}
+
+    @app.post("/api/cards/{card_id}/unsuspend")
+    def unsuspend_card(card_id: str, user: User = Depends(get_current_user)):
+        """Return a suspended card to the review queue."""
+        try:
+            card = Card.objects(id=card_id).first()
+        except Exception:
+            card = None
+        if card is None or card.deck.owner.id != user.id or card.deleted:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Card not found")
+        if card.suspended:
+            card.update(set__suspended=False)
+        return {"unsuspended": card_id}
+
+    @app.put("/api/cards/{card_id}/due")
+    def set_card_due(card_id: str, body: DueBody, user: User = Depends(get_current_user)):
+        """Reschedule a card by setting its due date (ISO datetime)."""
+        try:
+            due = fsrs_service.ensure_aware(datetime.fromisoformat(body.due))
+        except (ValueError, TypeError):
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST, "due must be an ISO datetime"
+            ) from None
+        if due is None:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST, "due must be an ISO datetime"
+            )
+        try:
+            card = Card.objects(id=card_id).first()
+        except Exception:
+            card = None
+        if card is None or card.deck.owner.id != user.id or card.deleted:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Card not found")
+        state = CardState.objects(user=user, card=card).first()
+        if state is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "No state for this card")
+        state.update(set__due=due)
+        state.reload()
+        return {"card_id": card_id, "due": state.due.isoformat()}
+
     @app.get("/api/cards/{card_id}")
     def get_card(card_id: str, user: User = Depends(get_current_user)):
         """Full review payload for one card (used to queue a related card)."""
@@ -744,6 +867,7 @@ def create_app() -> FastAPI:
                         existing[key] = None
                         card = Card(
                             deck=deck,
+                            card_number=_next_card_number(),
                             front_html=apkg_import.rewrite_media_refs(
                                 icard.front_html, filename_to_url
                             ),
@@ -835,6 +959,56 @@ def create_app() -> FastAPI:
         finally:
             Path(tmp_path).unlink(missing_ok=True)
         return drain(run_save(result))
+
+    @app.get("/api/export")
+    def export_decks(
+        deck_ids: str = Query(...), user: User = Depends(get_current_user)
+    ):
+        """Export one or more decks as a single .apkg file (Anki format).
+
+        Takes a comma-separated list of deck ids in ``deck_ids``. Builds a
+        fresh Anki collection containing those decks' non-deleted cards
+        (Basic notes: Front/Back HTML) and returns the packaged file.
+        Scheduling and media references are not carried over.
+        """
+        from fastapi.responses import FileResponse
+        from starlette.background import BackgroundTask
+
+        ids = [d.strip() for d in (deck_ids or "").split(",") if d.strip()]
+        if not ids:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST, "deck_ids must list at least one deck"
+            )
+        decks = []
+        for did in ids:
+            try:
+                deck = Deck.objects(owner=user, id=did).first()
+            except Exception:
+                deck = None
+            if deck is None:
+                raise HTTPException(status.HTTP_404_NOT_FOUND, "Deck not found")
+            decks.append(deck)
+        tmpdir = tempfile.mkdtemp(prefix="smarthole-export-")
+        out_path = str(Path(tmpdir) / "export.apkg")
+        try:
+            _export_apkg(decks, out_path)
+        except Exception as exc:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+            raise HTTPException(
+                status.HTTP_502_BAD_GATEWAY, f"Export failed: {exc}"
+            ) from exc
+        if len(decks) == 1:
+            safe = re.sub(r"[^A-Za-z0-9 _.-]+", "", decks[0].name).strip() or "deck"
+            filename = f"{safe}.apkg"
+        else:
+            filename = "smarthole-export.apkg"
+        cleanup = BackgroundTask(shutil.rmtree, tmpdir, True)
+        return FileResponse(
+            out_path,
+            media_type="application/octet-stream",
+            filename=filename,
+            background=cleanup,
+        )
 
     @app.get("/api/next")
     def next_cards(
@@ -956,6 +1130,21 @@ def create_app() -> FastAPI:
                 }
             )
         visible = [c for c in cards if not c.deleted]
+        added_per_day = []
+        for i in range(29, -1, -1):
+            day = today - timedelta(days=i)
+            nxt = day + timedelta(days=1)
+            added_per_day.append(
+                {
+                    "date": day.date().isoformat(),
+                    "added": sum(
+                        1
+                        for c in visible
+                        if c.created_at is not None
+                        and day <= aware(c.created_at) < nxt
+                    ),
+                }
+            )
         return {
             "totals": {
                 "cards": len(visible),
@@ -972,6 +1161,7 @@ def create_app() -> FastAPI:
                 "accuracy": accuracy,
             },
             "forecast": forecast,
+            "added_per_day": added_per_day,
         }
 
     @app.get("/media/{sha}")
@@ -1081,6 +1271,39 @@ def _store_media(media: dict[str, bytes]) -> dict[str, str]:
 
 def _day_start() -> datetime:
     return utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+def _export_apkg(decks, out_path: str) -> None:
+    """Write the given decks' non-deleted cards to an .apkg file.
+
+    Uses Anki's own backend (same package the importer uses) so the file
+    re-imports cleanly: one Basic note per card, Front/Back as stored HTML.
+    """
+    from anki.collection import Collection, ExportAnkiPackageOptions
+
+    workdir = Path(tempfile.mkdtemp(prefix="smarthole-export-col-"))
+    col = Collection(str(workdir / "export.anki2"))
+    try:
+        basic = col.models.by_name("Basic")
+        if basic is None:
+            raise RuntimeError("Fresh Anki collection has no Basic notetype")
+        for deck in decks:
+            did = col.decks.id(deck.name)
+            for card in Card.objects(deck=deck, deleted__ne=True):
+                note = col.new_note(basic)
+                note["Front"] = card.front_html or ""
+                note["Back"] = card.back_html or ""
+                col.add_note(note, did)
+        options = ExportAnkiPackageOptions(
+            with_scheduling=False, with_deck_configs=False, with_media=False
+        )
+        col.export_anki_package(out_path=out_path, options=options, limit=None)
+    finally:
+        try:
+            col.close()
+        except Exception:
+            pass
+        shutil.rmtree(workdir, ignore_errors=True)
 
 
 def _active_cards(user: User, deck: Deck | None) -> dict:

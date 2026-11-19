@@ -59,10 +59,32 @@ ALLOWED_TAGS = [
 ]
 ALLOWED_ATTRS = {
     "img": ["src", "alt"],
-    "a": ["href"],
+    "a": ["href", "target", "rel"],
     "audio": ["src", "controls"],
     "source": ["src", "type"],
 }
+
+_LINK_TAG_RE = re.compile(r"<a\b([^>]*)>", re.IGNORECASE)
+
+
+def _links_new_tab(html: str) -> str:
+    """Force card links to open in a new browser tab.
+
+    Imported Anki HTML and markdown-generated links carry no ``target``,
+    so they would navigate the review page away. Preserve an explicit
+    ``target`` when the author set one, but always ensure the safe
+    ``rel`` pairing when opening a new tab.
+    """
+
+    def _fix(match: re.Match) -> str:
+        attrs = match.group(1)
+        if re.search(r"\btarget\s*=", attrs, re.IGNORECASE):
+            if re.search(r"\brel\s*=", attrs, re.IGNORECASE):
+                return match.group(0)
+            return f"<a{attrs} rel=\"noopener noreferrer\">"
+        return f"<a{attrs} target=\"_blank\" rel=\"noopener noreferrer\">"
+
+    return _LINK_TAG_RE.sub(_fix, html)
 
 
 @dataclass
@@ -101,7 +123,8 @@ class ImportResult:
 def sanitize(html: str) -> str:
     # Drop template chrome entirely (bleach would keep the CSS text).
     html = re.sub(r"(?is)<(style|script)[^>]*>.*?</\1>", "", html)
-    return bleach.clean(html, tags=ALLOWED_TAGS, attributes=ALLOWED_ATTRS, strip=True)
+    cleaned = bleach.clean(html, tags=ALLOWED_TAGS, attributes=ALLOWED_ATTRS, strip=True)
+    return _links_new_tab(cleaned)
 
 
 def html_to_text(html: str) -> str:

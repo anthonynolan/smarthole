@@ -31,7 +31,7 @@ from .mcp_auth import (
     SmartholeTokenVerifier,
 )
 from .mcp_card_widget import WIDGET_MIME, WIDGET_URI, get_card_widget_html
-from .models import Card, CardState, Deck, User
+from .models import Card, CardState, Deck, User, next_card_number
 
 __all__ = ["mcp", "create_mcp_server", "MCP_SCOPES"]
 
@@ -157,6 +157,7 @@ def _persist_card(user, deck, front: str, back: str) -> Card:
     new_position = max((c.new_position or 0 for c in existing), default=0) + 1
     card = Card(
         deck=deck,
+        card_number=next_card_number(),
         front_html=apkg_import.sanitize(front),
         back_html=apkg_import.sanitize(back),
         new_position=new_position,

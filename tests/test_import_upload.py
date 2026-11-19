@@ -8,9 +8,9 @@ import mongomock
 import pytest
 from fastapi.testclient import TestClient
 from mongoengine import connect, disconnect
+from test_review_flow import make_apkg, register
 
 from smarthole import app as app_module
-from test_review_flow import make_apkg, register
 
 
 @pytest.fixture()

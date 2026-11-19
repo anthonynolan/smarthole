@@ -52,8 +52,8 @@ test('drawer navigates to Import view', async () => {
   render(<App />);
   await waitFor(() => expect(screen.getByLabelText('menu')).toBeTruthy());
   fireEvent.click(screen.getByLabelText('menu'));
-  await waitFor(() => expect(screen.getAllByText('Import')[0]).toBeTruthy());
-  fireEvent.click(screen.getAllByText('Import')[0]);
+  await waitFor(() => expect(screen.getAllByText('Import/Export')[0]).toBeTruthy());
+  fireEvent.click(screen.getAllByText('Import/Export')[0]);
   await waitFor(() =>
     expect(screen.getByText('Choose .apkg / .colpkg file')).toBeTruthy(),
   );
@@ -63,7 +63,8 @@ test('drawer navigates to Import view', async () => {
 test('review view shows the due-today count', async () => {
   mockApi();
   render(<App />);
-  await waitFor(() => expect(screen.getByText('5 due today')).toBeTruthy());
+  await waitFor(() => expect(screen.getByText(/5 due today/)).toBeTruthy());
+  await waitFor(() => expect(screen.getByText(/4 studied today/)).toBeTruthy());
   vi.unstubAllGlobals();
 });
 
@@ -139,6 +140,53 @@ test('browse shows a divider between due-today and later cards', async () => {
   fireEvent.click(screen.getByLabelText('menu'));
   fireEvent.click(screen.getAllByText('Browse')[0]);
   await waitFor(() => expect(screen.getByTestId('due-divider')).toBeTruthy());
+  vi.unstubAllGlobals();
+});
+
+test('browse shows created date and suspended flag columns', async () => {
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (url: any) => {
+      const u = String(url);
+      const body = (v: any) => ({ ok: true, json: () => Promise.resolve(v) });
+      if (u === '/api/config') return body({ googleClientId: null });
+      if (u === '/api/me') return body({ email: 't@example.com' });
+      if (u === '/api/decks')
+        return body({
+          decks: [{ id: 'd1', name: 'Test', total: 10, due: 3, due_today: 5, new: 2 }],
+        });
+      if (u.startsWith('/api/next')) return body({ cards: [] });
+      if (u.startsWith('/api/decks/d1/cards'))
+        return body({
+          cards: [
+            {
+              card_id: 'c1',
+              card_number: 7,
+              front_text: 'Suspended Q',
+              due: '2026-11-08',
+              last_review: null,
+              created_at: '2026-10-01T00:00:00+00:00',
+              state: 2,
+              reps: 1,
+              suspended: true,
+              due_today: false,
+            },
+          ],
+          total: 1,
+        });
+      throw new Error(`unexpected fetch ${u}`);
+    }),
+  );
+  render(<App />);
+  await waitFor(() => expect(screen.getByLabelText('menu')).toBeTruthy());
+  fireEvent.click(screen.getByLabelText('menu'));
+  fireEvent.click(screen.getAllByText('Browse')[0]);
+  await waitFor(() => expect(screen.getByText('Suspended Q')).toBeTruthy());
+  expect(screen.getByText('Created')).toBeTruthy();
+  expect(screen.getByText('Susp.')).toBeTruthy();
+  expect(screen.getByText('7')).toBeTruthy();
+  expect(screen.getByText("1-Oct'26")).toBeTruthy();
+  expect(screen.getByText('Yes')).toBeTruthy();
   vi.unstubAllGlobals();
 });
 
@@ -474,8 +522,11 @@ test('AI review streams the output as it arrives', async () => {
   fireEvent.click(screen.getByRole('button', { name: 'AI review' }));
   await waitFor(() => expect(screen.getByRole('button', { name: 'Ask AI' })).toBeTruthy());
   fireEvent.click(screen.getByRole('button', { name: 'Ask AI' }));
-  // The partial output is visible before the stream completes.
-  await waitFor(() => expect(screen.getByTestId('ai-stream')).toBeTruthy());
+  // While streaming, only a progress indicator shows (no raw JSON dump).
+  await waitFor(() =>
+    expect(screen.getByLabelText('loading AI suggestions')).toBeTruthy(),
+  );
+  expect(screen.queryByTestId('ai-stream')).toBeNull();
   await waitFor(() =>
     expect(screen.getByText(/No changes suggested/)).toBeTruthy(),
   );
@@ -673,8 +724,8 @@ test('import shows streamed progress then the result', async () => {
   const { container } = render(<App />);
   await waitFor(() => expect(screen.getByLabelText('menu')).toBeTruthy());
   fireEvent.click(screen.getByLabelText('menu'));
-  await waitFor(() => expect(screen.getAllByText('Import')[0]).toBeTruthy());
-  fireEvent.click(screen.getAllByText('Import')[0]);
+  await waitFor(() => expect(screen.getAllByText('Import/Export')[0]).toBeTruthy());
+  fireEvent.click(screen.getAllByText('Import/Export')[0]);
   await waitFor(() =>
     expect(screen.getByText('Choose .apkg / .colpkg file')).toBeTruthy(),
   );
@@ -1087,4 +1138,66 @@ test('browse starts from the last-used deck', async () => {
     localStorage.removeItem('smarthole.browseDeckId');
   }
   vi.unstubAllGlobals();
+});
+
+test('browse bulk delete removes all selected cards with one confirm', async () => {
+  const row = (id: string, front: string) => ({
+    card_id: id,
+    front_text: front,
+    due: '2026-11-08',
+    last_review: null,
+    state: 2,
+    reps: 1,
+    suspended: false,
+    due_today: true,
+  });
+  const deleted = new Set<string>();
+  const fetchMock = vi.fn(async (url: any, init?: any) => {
+    const u = String(url);
+    const body = (v: any) => ({ ok: true, json: () => Promise.resolve(v) });
+    if (u === '/api/config') return body({ googleClientId: null });
+    if (u === '/api/me') return body({ email: 't@example.com' });
+    if (u === '/api/decks')
+      return body({
+        decks: [{ id: 'd1', name: 'Test', total: 10, due: 3, due_today: 5, new: 2 }],
+      });
+    if (u.startsWith('/api/next')) return body({ cards: [] });
+    if (u.startsWith('/api/decks/d1/cards')) {
+      const cards = [row('c1', 'Due Q'), row('c2', 'Later Q')].filter(
+        (c) => !deleted.has(c.card_id),
+      );
+      return body({ cards, total: cards.length });
+    }
+    const del = /^\/api\/cards\/([^/]+)$/.exec(u);
+    if (del && init?.method === 'DELETE') {
+      deleted.add(del[1]);
+      return body({ deleted: del[1], permanent: false });
+    }
+    throw new Error(`unexpected fetch ${u} ${init?.method ?? 'GET'}`);
+  });
+  vi.stubGlobal('fetch', fetchMock);
+  const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true);
+  try {
+    render(<App />);
+    await waitFor(() => expect(screen.getByLabelText('menu')).toBeTruthy());
+    fireEvent.click(screen.getByLabelText('menu'));
+    fireEvent.click(screen.getAllByText('Browse')[0]);
+    await waitFor(() => expect(screen.getByText('Due Q')).toBeTruthy());
+    expect(screen.getByText('Later Q')).toBeTruthy();
+    // Selecting one row offers a bulk delete for just that card…
+    fireEvent.click(screen.getByLabelText('Select card 1'));
+    await waitFor(() => expect(screen.getByText('1 selected')).toBeTruthy());
+    // …while the header checkbox selects everything visible.
+    fireEvent.click(screen.getByLabelText('Select all visible cards'));
+    await waitFor(() => expect(screen.getByText('2 selected')).toBeTruthy());
+    fireEvent.click(screen.getByRole('button', { name: 'Delete selected' }));
+    await waitFor(() => expect(screen.queryByText('Due Q')).toBeNull());
+    expect(screen.queryByText('Later Q')).toBeNull();
+    // One confirm for the whole batch, one DELETE per selected card.
+    expect(confirmSpy).toHaveBeenCalledTimes(1);
+    expect(deleted).toEqual(new Set(['c1', 'c2']));
+  } finally {
+    confirmSpy.mockRestore();
+    vi.unstubAllGlobals();
+  }
 });

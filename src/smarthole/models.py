@@ -24,6 +24,36 @@ def utcnow() -> datetime:
     return datetime.now(UTC)
 
 
+def next_card_number() -> int:
+    """Next persistent browse number (global, never reused)."""
+    try:
+        coll = Card._get_collection()
+        row = coll.find_one(
+            {"card_number": {"$ne": None}}, sort=[("card_number", -1)]
+        )
+        if row and row.get("card_number"):
+            return int(row["card_number"]) + 1
+    except Exception:
+        pass
+    return 1
+
+
+def ensure_card_number(card: "Card") -> int:
+    """Assign a persistent number if missing; return the card's number."""
+    try:
+        if getattr(card, "card_number", None):
+            return int(card.card_number)
+    except Exception:
+        pass
+    number = next_card_number()
+    try:
+        card.update(set__card_number=number)
+        card.reload()
+    except Exception:
+        pass
+    return number
+
+
 class User(Document):
     meta = {"collection": "users", "indexes": ["email"]}
 
@@ -70,6 +100,8 @@ class Card(Document):
     }
 
     deck = ReferenceField(Deck, required=True)
+    # Persistent browse number, assigned once when the card is written.
+    card_number = IntField()
     front_html = StringField(required=True)
     back_html = StringField(required=True)
     anki_nid = IntField()

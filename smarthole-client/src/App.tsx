@@ -1,4 +1,11 @@
-import { Fragment, useCallback, useEffect, useRef, useState } from 'react';
+import {
+  Fragment,
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type MouseEvent as ReactMouseEvent,
+} from 'react';
 import {
   Alert,
   AppBar,
@@ -35,7 +42,7 @@ import {
   Toolbar,
   Typography,
 } from '@mui/material';
-import { createTheme, ThemeProvider } from '@mui/material/styles';
+import { createTheme, ThemeProvider, type SxProps, type Theme } from '@mui/material/styles';
 import CssBaseline from '@mui/material/CssBaseline';
 import { GoogleLogin, GoogleOAuthProvider } from '@react-oauth/google';
 import {
@@ -61,6 +68,10 @@ import {
   register,
   requestAiReviewStream,
   restoreCard,
+  setCardDue,
+  suspendCard,
+  unsuspendCard,
+  exportDecks,
   updateCard,
   htmlToText,
   type AiReviewMode,
@@ -272,7 +283,7 @@ export default function App() {
               setDrawerOpen(false);
             }}
           >
-            <ListItemText primary="Import" />
+            <ListItemText primary="Import/Export" />
           </ListItemButton>
           <ListItemButton
             selected={view === 'stats'}
@@ -416,6 +427,34 @@ function useDecks() {
   return { decks, error, refresh };
 }
 
+/** Card body HTML with every link forced into a new browser tab.
+ * Stored HTML from older imports has no `target`, so it is enforced here at
+ * render time (covering middle-clicks too) while plain left-clicks are
+ * routed through `window.open` so the review page is never navigated away.
+ */
+function CardHtml({ html, sx }: { html: string; sx?: SxProps<Theme> }) {
+  const ref = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    el.querySelectorAll('a[href]').forEach((a) => {
+      a.setAttribute('target', '_blank');
+      a.setAttribute('rel', 'noopener noreferrer');
+    });
+  }, [html]);
+  const openLink = (e: ReactMouseEvent<HTMLDivElement>) => {
+    const anchor = (e.target as HTMLElement).closest?.('a[href]') as HTMLAnchorElement | null;
+    if (!anchor) return;
+    const href = anchor.getAttribute('href');
+    if (!href || href.startsWith('#') || /^javascript:/i.test(href)) return;
+    e.preventDefault();
+    window.open(href, '_blank', 'noopener,noreferrer');
+  };
+  return (
+    <Box ref={ref} sx={sx} onClick={openLink} dangerouslySetInnerHTML={{ __html: html }} />
+  );
+}
+
 /** All stored metadata for one card, to troubleshoot data/system issues. */
 function CardMetaView({ meta, card }: { meta: CardMeta | null; card: ReviewCard }) {
   const rows: Array<[string, string]> = meta
@@ -501,6 +540,7 @@ function ReviewView() {
   const [related, setRelated] = useState<RelatedCard[]>([]);
   const [queued, setQueued] = useState<ReviewCard | null>(null);
   const [queueBusy, setQueueBusy] = useState(false);
+  const [studiedToday, setStudiedToday] = useState<number | null>(null);
 
   // Best-effort preload of the card after the current one, so grading
   // swaps instantly instead of waiting on a fetch.
@@ -510,6 +550,15 @@ function ReviewView() {
       setPreloaded(cards[0] ?? null);
     } catch {
       setPreloaded(null);
+    }
+  }, []);
+
+  const refreshStudied = useCallback(async () => {
+    try {
+      const s = await getStats();
+      setStudiedToday(s.today.studied);
+    } catch {
+      setStudiedToday(null);
     }
   }, []);
 
@@ -551,7 +600,8 @@ function ReviewView() {
 
   useEffect(() => {
     loadNext(deckId);
-  }, [deckId, loadNext]);
+    void refreshStudied();
+  }, [deckId, loadNext, refreshStudied]);
 
   // Similarity hint: closest related card across the whole database.
   // Runs in the background; hides itself when embeddings are unavailable.
@@ -601,6 +651,7 @@ function ReviewView() {
         await loadNext(deckId);
       }
       await refresh();
+      await refreshStudied();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     }
@@ -683,25 +734,58 @@ function ReviewView() {
     setAiSelected((prev) => prev.map((v, j) => (j === i ? !v : v)));
 
   const applyAi = async () => {
-    if (!card) return;
+    if (!card || aiApplying) return;
+    const currentId = card.card_id;
+    const deckOfCard = card.deck_id;
+    const picked = aiSuggestions.filter((_, i) => aiSelected[i]);
+    const removeOriginal = aiDeleteOriginal;
     setAiError(null);
     setAiApplying(true);
+    // Move on immediately: close the dialog and queue the next card
+    // (excluding this one) while the creates + delete land in the
+    // background, so there is no UI wait on the writes.
+    setAiOpen(false);
+    setAiStarted(false);
+    setAiStreamed('');
+    setAiApplying(false);
+    setCard(null);
+    setShowBack(false);
+    setStatus(
+      picked.length
+        ? `Creating ${picked.length} card${picked.length === 1 ? '' : 's'}…`
+        : 'Loading next card…',
+    );
     try {
-      const picked = aiSuggestions.filter((_, i) => aiSelected[i]);
-      for (const s of picked) {
-        await createCard(card.deck_id, s.front, s.back);
+      const next = await getNext(deckId as '', currentId);
+      const upNext = next[0] ?? null;
+      if (upNext) {
+        setCard(upNext);
+        setStatus(null);
+        void prefetchNext(deckId, upNext.card_id);
+      } else {
+        await loadNext(deckId);
       }
-      if (aiDeleteOriginal) {
-        await deleteCard(card.card_id);
-      }
-      setStatus('AI cards created. Loading next card…');
-      await loadNext(deckId);
       await refresh();
+      await refreshStudied();
     } catch (e) {
-      setAiError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setAiApplying(false);
+      setError(e instanceof Error ? e.message : String(e));
     }
+    void (async () => {
+      try {
+        for (const s of picked) {
+          await createCard(deckOfCard, s.front, s.back);
+        }
+        if (removeOriginal) {
+          await deleteCard(currentId);
+        }
+        await refresh();
+        await refreshStudied();
+      } catch (e) {
+        setStatus(
+          `Next card loaded, but saving the split failed: ${e instanceof Error ? e.message : String(e)}`,
+        );
+      }
+    })();
   };
 
   const aiPickedCount = aiSelected.filter(Boolean).length;
@@ -767,6 +851,7 @@ function ReviewView() {
       <DeckSelect decks={decks} value={deckId} onChange={setDeckId} allowAll label="Deck" />
       <Typography color="text.secondary" sx={{ mt: 1 }}>
         {dueToday} due today
+        {studiedToday !== null && ` · ${studiedToday} studied today`}
       </Typography>
       {decksError && <Alert severity="error">Could not load decks: {decksError}</Alert>}
       {error && (
@@ -785,14 +870,11 @@ function ReviewView() {
               Created {fmtDate(card.created_at)}
             </Typography>
           )}
-          <Box
-            sx={{ ...qaTextSx, minHeight: 80 }}
-            dangerouslySetInnerHTML={{ __html: card.front_html }}
-          />
+          <CardHtml html={card.front_html} sx={{ ...qaTextSx, minHeight: 80 }} />
           {showBack && (
-            <Box
-              sx={{ ...qaTextSx, mt: 2, pt: 2, borderTop: '1px dashed #aaa' }}
-              dangerouslySetInnerHTML={{ __html: card.back_html }}
+            <CardHtml
+              html={card.back_html}
+              sx={{ ...qaTextSx, mt: 0, pt: 1, borderTop: '1px dashed #aaa' }}
             />
           )}
           {!showBack ? (
@@ -1070,16 +1152,6 @@ function ReviewView() {
               {aiStarted && aiLoading && (
                 <CircularProgress aria-label="loading AI suggestions" />
               )}
-              {aiStarted && (aiLoading || aiStreamed) && aiMode === 'split' && (
-                <Paper
-                  variant="outlined"
-                  sx={{ p: 2, mb: 1, whiteSpace: 'pre-wrap', fontSize: '0.85rem' }}
-                  aria-live="polite"
-                  data-testid="ai-stream"
-                >
-                  {aiStreamed || '…'}
-                </Paper>
-              )}
               {aiStarted && aiError && (
                 <Alert severity="error" sx={{ mb: 2 }}>
                   {aiError}
@@ -1162,6 +1234,15 @@ function ReviewView() {
 /** Last browse deck, so the first page can load in parallel with the deck list. */
 const BROWSE_DECK_KEY = 'smarthole.browseDeckId';
 
+/** ISO timestamp to a datetime-local input value (local time). */
+function toLocalInput(iso: string | null | undefined): string {
+  if (!iso) return '';
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return '';
+  const p = (n: number) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
 function BrowseView() {
   const { decks } = useDecks();
   const [deckId, setDeckId] = useState(() => {
@@ -1178,8 +1259,11 @@ function BrowseView() {
   const [committedQ, setCommittedQ] = useState('');
   const [showDeleted, setShowDeleted] = useState(false);
   const [showMcpOnly, setShowMcpOnly] = useState(false);
+  const [showSuspendedOnly, setShowSuspendedOnly] = useState(false);
   const [rowBusy, setRowBusy] = useState<string | null>(null);
   const [rowError, setRowError] = useState<string | null>(null);
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [bulkBusy, setBulkBusy] = useState(false);
   const [detailId, setDetailId] = useState<string | null>(null);
   const [detail, setDetail] = useState<ReviewCard | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
@@ -1189,13 +1273,17 @@ function BrowseView() {
   const [detailEditBack, setDetailEditBack] = useState('');
   const [detailEditBusy, setDetailEditBusy] = useState(false);
   const [detailEditError, setDetailEditError] = useState<string | null>(null);
+  const [detailDue, setDetailDue] = useState('');
+  const [detailSchedBusy, setDetailSchedBusy] = useState(false);
+  const [detailSchedError, setDetailSchedError] = useState<string | null>(null);
   const sentinelRef = useRef<HTMLDivElement | null>(null);
-  const stateRef = useRef({ deckId, q: '', showDeleted: false, showMcpOnly: false, loading: false, total: Infinity as number });
+  const stateRef = useRef({ deckId, q: '', showDeleted: false, showMcpOnly: false, showSuspendedOnly: false, loading: false, total: Infinity as number });
   stateRef.current = {
     deckId,
     q: committedQ,
     showDeleted,
     showMcpOnly,
+    showSuspendedOnly,
     loading,
     total: rows.length >= total && total > 0 ? total : (Number.isFinite(stateRef.current.total) ? stateRef.current.total : Infinity),
   };
@@ -1231,12 +1319,13 @@ function BrowseView() {
   useEffect(() => {
     setRows([]);
     setTotal(0);
+    setSelected(new Set());
     stateRef.current.total = Infinity;
     if (!deckId) return;
     let cancelled = false;
     setLoading(true);
     setRowError(null);
-    browseCards(deckId, 'due', 'asc', 0, BROWSE_PAGE, committedQ, showDeleted, showMcpOnly)
+    browseCards(deckId, 'due', 'asc', 0, BROWSE_PAGE, committedQ, showDeleted, showMcpOnly, showSuspendedOnly)
       .then(({ cards, total: t }) => {
         if (cancelled) return;
         setRows(cards);
@@ -1255,7 +1344,7 @@ function BrowseView() {
     return () => {
       cancelled = true;
     };
-  }, [deckId, committedQ, showDeleted, showMcpOnly]);
+  }, [deckId, committedQ, showDeleted, showMcpOnly, showSuspendedOnly]);
 
   const reloadBrowse = useCallback(async () => {
     if (!deckId) return;
@@ -1263,20 +1352,26 @@ function BrowseView() {
     setRowError(null);
     try {
       const { cards, total: t } = await browseCards(
-        deckId, 'due', 'asc', 0, BROWSE_PAGE, committedQ, showDeleted, showMcpOnly,
+        deckId, 'due', 'asc', 0, BROWSE_PAGE, committedQ, showDeleted, showMcpOnly, showSuspendedOnly,
       );
       setRows(cards);
       setTotal(t);
     } finally {
       setLoading(false);
     }
-  }, [deckId, committedQ, showDeleted, showMcpOnly]);
+  }, [deckId, committedQ, showDeleted, showMcpOnly, showSuspendedOnly]);
 
   const handleRestore = async (cardId: string) => {
     setRowError(null);
     setRowBusy(cardId);
     try {
       await restoreCard(cardId);
+      setSelected((prev) => {
+        if (!prev.has(cardId)) return prev;
+        const next = new Set(prev);
+        next.delete(cardId);
+        return next;
+      });
       await reloadBrowse();
     } catch (e) {
       setRowError(e instanceof Error ? e.message : String(e));
@@ -1295,10 +1390,14 @@ function BrowseView() {
     setDetail(null);
     setDetailError(null);
     setDetailEditing(false);
+    setDetailDue('');
+    setDetailSchedError(null);
     setDetailLoading(true);
     getCard(detailId)
       .then((c) => {
-        if (!cancelled) setDetail(c);
+        if (cancelled) return;
+        setDetail(c);
+        setDetailDue(toLocalInput(c.due));
       })
       .catch(() => {
         if (!cancelled) setDetailError('Could not load the full card detail.');
@@ -1339,17 +1438,89 @@ function BrowseView() {
     }
   };
 
+  const toggleDetailSuspend = async () => {
+    if (!detail || !detailId || detailSchedBusy) return;
+    setDetailSchedError(null);
+    setDetailSchedBusy(true);
+    try {
+      if (detail.meta?.suspended) {
+        await unsuspendCard(detailId);
+      } else {
+        await suspendCard(detailId);
+      }
+      setDetail(await getCard(detailId));
+      await reloadBrowse();
+    } catch (e) {
+      setDetailSchedError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setDetailSchedBusy(false);
+    }
+  };
+
+  const saveDetailDue = async () => {
+    if (!detail || !detailId || detailSchedBusy || !detailDue) return;
+    const parsed = new Date(detailDue);
+    if (Number.isNaN(parsed.getTime())) {
+      setDetailSchedError('Enter a valid date and time.');
+      return;
+    }
+    setDetailSchedError(null);
+    setDetailSchedBusy(true);
+    try {
+      await setCardDue(detailId, parsed.toISOString());
+      const refreshed = await getCard(detailId);
+      setDetail(refreshed);
+      setDetailDue(toLocalInput(refreshed.due));
+      await reloadBrowse();
+    } catch (e) {
+      setDetailSchedError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setDetailSchedBusy(false);
+    }
+  };
+
   const handlePermanentDelete = async (cardId: string) => {
     if (!window.confirm('Permanently delete this card? Its schedule and review history are removed too. This cannot be undone.')) return;
     setRowError(null);
     setRowBusy(cardId);
     try {
       await deleteCard(cardId, true);
+      setSelected((prev) => {
+        if (!prev.has(cardId)) return prev;
+        const next = new Set(prev);
+        next.delete(cardId);
+        return next;
+      });
       await reloadBrowse();
     } catch (e) {
       setRowError(e instanceof Error ? e.message : String(e));
     } finally {
       setRowBusy(null);
+    }
+  };
+
+  /** Delete every selected visible card behind a single confirm. */
+  const handleBulkDelete = async (ids: string[], permanent: boolean) => {
+    if (bulkBusy || ids.length === 0) return;
+    const noun = ids.length === 1 ? '1 selected card' : `${ids.length} selected cards`;
+    const ok = window.confirm(
+      permanent
+        ? `Permanently delete ${noun}? Their schedules and review histories are removed too. This cannot be undone.`
+        : `Delete ${noun}? They stay restorable from "Show deleted".`,
+    );
+    if (!ok) return;
+    setRowError(null);
+    setBulkBusy(true);
+    try {
+      for (const id of ids) {
+        await deleteCard(id, permanent);
+      }
+      setSelected(new Set());
+      await reloadBrowse();
+    } catch (e) {
+      setRowError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBulkBusy(false);
     }
   };
 
@@ -1375,6 +1546,7 @@ function BrowseView() {
           s.q,
           s.showDeleted,
           s.showMcpOnly,
+          s.showSuspendedOnly,
         );
         if (stopped) return;
         setRows((prev) => [...prev, ...cards]);
@@ -1430,6 +1602,30 @@ function BrowseView() {
     : [...searchedRows].sort((a, b) => Number(b.due_today) - Number(a.due_today));
   const splitIdx = showDeleted ? -1 : visibleRows.findIndex((r) => !r.due_today);
 
+  const toggleSelect = (cardId: string) =>
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(cardId)) next.delete(cardId);
+      else next.add(cardId);
+      return next;
+    });
+  const selectedVisibleIds = visibleRows
+    .filter((r) => selected.has(r.card_id))
+    .map((r) => r.card_id);
+  const allVisibleSelected =
+    visibleRows.length > 0 && visibleRows.every((r) => selected.has(r.card_id));
+  const someVisibleSelected = visibleRows.some((r) => selected.has(r.card_id));
+  const toggleSelectAll = () =>
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (visibleRows.every((r) => prev.has(r.card_id))) {
+        visibleRows.forEach((r) => next.delete(r.card_id));
+      } else {
+        visibleRows.forEach((r) => next.add(r.card_id));
+      }
+      return next;
+    });
+
   return (
     <Box>
       <FormControl fullWidth size="small" sx={{ mb: 1 }}>
@@ -1480,6 +1676,15 @@ function BrowseView() {
         }
         label="Show MCP-created"
       />
+      <FormControlLabel
+        control={
+          <Checkbox
+            checked={showSuspendedOnly}
+            onChange={(e) => setShowSuspendedOnly(e.target.checked)}
+          />
+        }
+        label="Show suspended"
+      />
       {showDeleted && (
         <Typography variant="body2" color="text.secondary" sx={{ mb: 1 }}>
           Deleted cards only — restore one, or permanently delete it (schedule
@@ -1492,21 +1697,61 @@ function BrowseView() {
           checkboxes before creation.
         </Typography>
       )}
+      {showSuspendedOnly && (
+        <Typography variant="body2" color="text.secondary" sx={{ mb: 1 }}>
+          Suspended cards only — unsuspend a card from its card detail
+          to return it to the review queue.
+        </Typography>
+      )}
       {rowError && (
         <Alert severity="error" sx={{ mb: 1 }}>
           {rowError}
         </Alert>
       )}
+      {selectedVisibleIds.length > 0 && (
+        <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 1 }}>
+          <Typography variant="body2" color="text.secondary">
+            {selectedVisibleIds.length} selected
+          </Typography>
+          <Button
+            size="small"
+            variant="outlined"
+            color="error"
+            onClick={() => void handleBulkDelete(selectedVisibleIds, showDeleted)}
+            disabled={bulkBusy || rowBusy !== null}
+          >
+            {bulkBusy
+              ? 'Deleting…'
+              : showDeleted
+                ? 'Delete selected forever'
+                : 'Delete selected'}
+          </Button>
+          <Button size="small" onClick={() => setSelected(new Set())} disabled={bulkBusy}>
+            Clear
+          </Button>
+        </Box>
+      )}
       <TableContainer sx={{ overflowX: 'hidden' }}>
         <Table size="small" sx={{ tableLayout: 'fixed', width: '100%' }}>
           <TableHead>
             <TableRow>
+              <TableCell sx={{ width: '2.5rem' }} padding="checkbox">
+                <Checkbox
+                  inputProps={{ 'aria-label': 'Select all visible cards' }}
+                  checked={allVisibleSelected}
+                  indeterminate={someVisibleSelected && !allVisibleSelected}
+                  onChange={toggleSelectAll}
+                  disabled={visibleRows.length === 0}
+                />
+              </TableCell>
               <TableCell sx={{ width: '2.5rem', textAlign: 'right' }}>#</TableCell>
               <TableCell>Question</TableCell>
               <TableCell sx={{ width: '8.5rem', fontWeight: 'bold' }}>Due</TableCell>
               <TableCell sx={{ width: '8.5rem', fontWeight: 'bold' }}>
                 Last reviewed
               </TableCell>
+              <TableCell sx={{ width: '8.5rem', fontWeight: 'bold' }}>Created</TableCell>
+              <TableCell sx={{ width: '5rem', fontWeight: 'bold' }}>Susp.</TableCell>
               {showDeleted && (
                 <TableCell sx={{ width: '12rem', fontWeight: 'bold' }}>Actions</TableCell>
               )}
@@ -1517,7 +1762,7 @@ function BrowseView() {
               <Fragment key={r.card_id}>
                 {i === splitIdx && splitIdx > 0 && (
                   <TableRow data-testid="due-divider">
-                    <TableCell colSpan={4} sx={{ p: 0, borderBottom: 'none', height: '3px' }}>
+                    <TableCell colSpan={showDeleted ? 8 : 7} sx={{ p: 0, borderBottom: 'none', height: '3px' }}>
                       <Box
                         sx={{
                           borderTop: '3px solid',
@@ -1533,12 +1778,22 @@ function BrowseView() {
                   onClick={() => setDetailId(r.card_id)}
                   sx={{ cursor: 'pointer' }}
                 >
-                  <TableCell sx={{ textAlign: 'right' }}>{i + 1}</TableCell>
+                  <TableCell padding="checkbox" onClick={(e) => e.stopPropagation()}>
+                    <Checkbox
+                      inputProps={{ 'aria-label': `Select card ${i + 1}` }}
+                      checked={selected.has(r.card_id)}
+                      onChange={() => toggleSelect(r.card_id)}
+                      onClick={(e) => e.stopPropagation()}
+                    />
+                  </TableCell>
+                  <TableCell sx={{ textAlign: 'right' }}>{r.card_number ?? '—'}</TableCell>
                   <TableCell sx={{ whiteSpace: 'normal', overflowWrap: 'break-word' }}>
                     {r.front_text}
                   </TableCell>
                   <TableCell>{fmtDate(r.due)}</TableCell>
                   <TableCell>{fmtDate(r.last_review)}</TableCell>
+                  <TableCell>{fmtDate(r.created_at ?? null)}</TableCell>
+                  <TableCell>{r.suspended ? 'Yes' : '—'}</TableCell>
                   {showDeleted && (
                     <TableCell>
                       <Box sx={{ display: 'flex', gap: 1, flexWrap: 'wrap' }}>
@@ -1628,12 +1883,63 @@ function BrowseView() {
               </>
             ) : (
               <>
-                <Box sx={qaTextSx} dangerouslySetInnerHTML={{ __html: detail.front_html }} />
-                <Box
+                <CardHtml html={detail.front_html} sx={qaTextSx} />
+                <CardHtml
+                  html={detail.back_html}
                   sx={{ ...qaTextSx, mt: 2, pt: 2, borderTop: '1px dashed #aaa' }}
-                  dangerouslySetInnerHTML={{ __html: detail.back_html }}
                 />
                 <CardMetaView meta={detail.meta} card={detail} />
+                <Box sx={{ mt: 2, pt: 2, borderTop: '1px dashed #aaa' }}>
+                  <Typography variant="subtitle2" gutterBottom>
+                    Scheduling
+                  </Typography>
+                  <Typography variant="body2" color="text.secondary" sx={{ mb: 1 }}>
+                    {detail.meta?.suspended
+                      ? 'Suspended — hidden from the review queue.'
+                      : 'In the review queue.'}
+                  </Typography>
+                  <Box sx={{ display: 'flex', gap: 1, flexWrap: 'wrap', mb: 2 }}>
+                    <Button
+                      variant="outlined"
+                      size="small"
+                      onClick={() => void toggleDetailSuspend()}
+                      disabled={detailSchedBusy}
+                    >
+                      {detail.meta?.suspended ? 'Unsuspend' : 'Suspend'}
+                    </Button>
+                  </Box>
+                  <Box
+                    sx={{
+                      display: 'flex',
+                      gap: 1,
+                      flexWrap: 'wrap',
+                      alignItems: 'center',
+                    }}
+                  >
+                    <TextField
+                      label="Due date"
+                      type="datetime-local"
+                      size="small"
+                      value={detailDue}
+                      onChange={(e) => setDetailDue(e.target.value)}
+                      disabled={detailSchedBusy}
+                      sx={{ minWidth: 220 }}
+                    />
+                    <Button
+                      variant="outlined"
+                      size="small"
+                      onClick={() => void saveDetailDue()}
+                      disabled={detailSchedBusy || !detailDue}
+                    >
+                      Save due date
+                    </Button>
+                  </Box>
+                  {detailSchedError && (
+                    <Alert severity="error" sx={{ mt: 1 }}>
+                      {detailSchedError}
+                    </Alert>
+                  )}
+                </Box>
               </>
             )
           ) : (
@@ -1643,7 +1949,8 @@ function BrowseView() {
                 <Box sx={qaTextSx}>{detailRow.front_text}</Box>
                 <Typography variant="body2" color="text.secondary" sx={{ mt: 1 }}>
                   Due {fmtDate(detailRow.due)} · Last reviewed{' '}
-                  {fmtDate(detailRow.last_review)}
+                  {fmtDate(detailRow.last_review)} · Created{' '}
+                  {fmtDate(detailRow.created_at ?? null)}
                 </Typography>
               </>
             )
@@ -1746,11 +2053,15 @@ function stageLabel(stage: string): string {
 }
 
 function ImportView() {
+  const { decks } = useDecks();
   const [file, setFile] = useState<File | null>(null);
   const [result, setResult] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [progress, setProgress] = useState<ImportProgress | null>(null);
+  const [exportIds, setExportIds] = useState<Set<string>>(new Set());
+  const [exportBusy, setExportBusy] = useState(false);
+  const [exportError, setExportError] = useState<string | null>(null);
 
   const submit = async () => {
     setResult(null);
@@ -1775,9 +2086,35 @@ function ImportView() {
     }
   };
 
+  const submitExport = async () => {
+    setExportError(null);
+    const ids = [...exportIds];
+    if (ids.length === 0) {
+      setExportError('Tick at least one deck to export.');
+      return;
+    }
+    setExportBusy(true);
+    try {
+      await exportDecks(ids);
+    } catch (e) {
+      setExportError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setExportBusy(false);
+    }
+  };
+
+  const toggleExportDeck = (id: string) =>
+    setExportIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+
   const determinate = progress !== null && progress.total > 1;
   return (
     <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+      <Typography variant="h6">Import</Typography>
       <Button variant="outlined" component="label" disabled={busy}>
         {file ? file.name : 'Choose .apkg / .colpkg file'}
         <input
@@ -1811,6 +2148,35 @@ function ImportView() {
       )}
       {result && <Alert severity="success">{result}</Alert>}
       {error && <Alert severity="error">{error}</Alert>}
+      <Typography variant="h6" sx={{ mt: 2 }}>
+        Export
+      </Typography>
+      <Typography variant="body2" color="text.secondary">
+        Download one or more decks as a single .apkg file. Scheduling and
+        media references are not carried over.
+      </Typography>
+      {decks.map((d) => (
+        <FormControlLabel
+          key={d.id}
+          control={
+            <Checkbox
+              checked={exportIds.has(d.id)}
+              onChange={() => toggleExportDeck(d.id)}
+            />
+          }
+          label={`${d.name} (${d.total})`}
+        />
+      ))}
+      <Box>
+        <Button
+          variant="contained"
+          disabled={exportBusy || exportIds.size === 0}
+          onClick={submitExport}
+        >
+          {exportBusy ? 'Exporting…' : 'Export .apkg'}
+        </Button>
+      </Box>
+      {exportError && <Alert severity="error">{exportError}</Alert>}
     </Box>
   );
 }
@@ -1831,7 +2197,11 @@ function StatsView() {
   if (!stats) {
     return <Typography color="text.secondary">Loading stats…</Typography>;
   }
-  const maxDue = Math.max(1, ...stats.forecast.map((f) => f.due));
+  // Tomorrow leftmost: today's bar is the "Due now" card above.
+  const forecast = stats.forecast.slice(1);
+  const maxDue = Math.max(1, ...forecast.map((f) => f.due));
+  const added = stats.added_per_day ?? [];
+  const maxAdded = Math.max(1, ...added.map((d) => d.added));
   const cards: Array<[string, string]> = [
     ['Due now', String(stats.totals.due)],
     ['New cards left', String(stats.totals.new)],
@@ -1854,17 +2224,87 @@ function StatsView() {
         ))}
       </Box>
       <Typography variant="h6">Due forecast</Typography>
-      {stats.forecast.map((f) => (
-        <Box key={f.date} sx={{ display: 'flex', alignItems: 'center', gap: 2 }}>
-          <Typography sx={{ width: 104, flexShrink: 0 }}>{fmtDate(f.date)}</Typography>
-          <LinearProgress
-            variant="determinate"
-            value={(100 * f.due) / maxDue}
-            sx={{ flexGrow: 1 }}
-          />
-          <Typography sx={{ width: 48, textAlign: 'right' }}>{f.due}</Typography>
-        </Box>
-      ))}
+      <Box
+        sx={{
+          display: 'flex',
+          alignItems: 'flex-end',
+          gap: 1,
+          height: 190,
+          overflowX: 'auto',
+          pb: 1,
+        }}
+      >
+        {forecast.map((f) => (
+          <Box
+            key={f.date}
+            sx={{
+              display: 'flex',
+              flexDirection: 'column',
+              alignItems: 'center',
+              justifyContent: 'flex-end',
+              minWidth: 40,
+              height: '100%',
+            }}
+            title={`${fmtDate(f.date)}: ${f.due} due`}
+          >
+            <Typography variant="caption">{f.due || ''}</Typography>
+            <Box
+              sx={{
+                width: 22,
+                height: `${Math.max(f.due > 0 ? 8 : 2, (f.due / maxDue) * 120)}px`,
+                bgcolor: 'primary.main',
+                borderRadius: '4px 4px 0 0',
+              }}
+            />
+            <Typography variant="caption" color="text.secondary">
+              {fmtDate(f.date)}
+            </Typography>
+          </Box>
+        ))}
+      </Box>
+      {added.length > 0 && (
+        <>
+          <Typography variant="h6">Cards added per day</Typography>
+          <Box
+            sx={{
+              display: 'flex',
+              alignItems: 'flex-end',
+              gap: 1,
+              height: 190,
+              overflowX: 'auto',
+              pb: 1,
+            }}
+          >
+            {added.map((d) => (
+              <Box
+                key={d.date}
+                sx={{
+                  display: 'flex',
+                  flexDirection: 'column',
+                  alignItems: 'center',
+                  justifyContent: 'flex-end',
+                  minWidth: 40,
+                  height: '100%',
+                }}
+                title={`${fmtDate(d.date)}: ${d.added} added`}
+              >
+                <Typography variant="caption">{d.added || ''}</Typography>
+                <Box
+                  sx={{
+                    width: 22,
+                    height: `${Math.max(d.added > 0 ? 8 : 2, (d.added / maxAdded) * 120)}px`,
+                    bgcolor: 'secondary.main',
+                    borderRadius: '4px 4px 0 0',
+                  }}
+                />
+                <Typography variant="caption" color="text.secondary">
+                  {fmtDate(d.date)}
+                </Typography>
+              </Box>
+            ))}
+          </Box>
+        </>
+      )}
     </Box>
   );
 }

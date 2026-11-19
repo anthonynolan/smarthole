@@ -502,10 +502,10 @@ def test_stats(client, tmp_path):
     assert stats["today"]["studied"] == 1
     assert stats["today"]["new"] == 1
     assert stats["today"]["accuracy"] == 100.0
-    # Single wave per day: the graded card is due tomorrow, while the
-    # untouched learning card is still due today.
-    assert stats["forecast"][0]["due"] == 1
-    assert stats["forecast"][1]["due"] == 1
+    # Intraday steps: the graded card is still due today, alongside the
+    # untouched learning card.
+    assert stats["forecast"][0]["due"] == 2
+    assert stats["forecast"][1]["due"] == 0
     assert sum(f["due"] for f in stats["forecast"]) == 2
 
 
@@ -626,6 +626,7 @@ def test_browse_deck(client, tmp_path):
     assert by_text["RQ"]["last_review"] is not None  # adopted Anki history
     assert by_text["LQ"]["last_review"] is None
     assert by_text["NQ"]["last_review"] is None
+    assert all(r["created_at"] for r in rows)
     suspended = [r for r in rows if r["front_text"] == "SQ"][0]
     assert suspended["suspended"] is True
 
@@ -958,3 +959,138 @@ def test_decks_counts_grouped_per_deck(client, tmp_path):
     assert decks["D2"]["new"] == 0
     assert decks["D2"]["due"] == 1
     assert decks["D2"]["due_today"] == 1
+
+
+def test_suspend_unsuspend_round_trip(client, tmp_path):
+    register(client)
+    apkg = make_apkg(tmp_path)
+    with open(apkg, "rb") as f:
+        assert (
+            client.post(
+                "/api/import", files={"file": ("test.apkg", f, "application/zip")}
+            ).status_code
+            == 201
+        )
+    deck_id = client.get("/api/decks").json()["decks"][0]["id"]
+    card_id = client.get(f"/api/decks/{deck_id}/cards").json()["cards"][0]["card_id"]
+
+    assert client.post(f"/api/cards/{card_id}/suspend").status_code == 200
+    rows = client.get(f"/api/decks/{deck_id}/cards?limit=100").json()["cards"]
+    assert [r for r in rows if r["card_id"] == card_id][0]["suspended"] is True
+    only = client.get(
+        f"/api/decks/{deck_id}/cards?suspended_only=true&limit=100"
+    ).json()["cards"]
+    assert {r["card_id"] for r in only} == {card_id}
+    assert all(
+        r["card_id"] != card_id for r in client.get("/api/next").json()["cards"]
+    )
+
+    assert client.post(f"/api/cards/{card_id}/unsuspend").status_code == 200
+    rows = client.get(f"/api/decks/{deck_id}/cards?limit=100").json()["cards"]
+    assert [r for r in rows if r["card_id"] == card_id][0]["suspended"] is False
+    assert (
+        client.get(f"/api/decks/{deck_id}/cards?suspended_only=true").json()["cards"]
+        == []
+    )
+
+
+def test_set_card_due_reschedules(client, tmp_path):
+    from datetime import datetime, timedelta, timezone
+
+    register(client)
+    apkg = make_apkg(tmp_path)
+    with open(apkg, "rb") as f:
+        assert (
+            client.post(
+                "/api/import", files={"file": ("test.apkg", f, "application/zip")}
+            ).status_code
+            == 201
+        )
+    deck_id = client.get("/api/decks").json()["decks"][0]["id"]
+    card_id = client.get(f"/api/decks/{deck_id}/cards").json()["cards"][0]["card_id"]
+
+    past = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+    res = client.put(f"/api/cards/{card_id}/due", json={"due": past})
+    assert res.status_code == 200, res.text
+    assert res.json()["due"] == past or res.json()["due"].startswith(past[:19])
+    assert any(
+        c["card_id"] == card_id for c in client.get("/api/next").json()["cards"]
+    )
+
+    future = (datetime.now(timezone.utc) + timedelta(days=30)).isoformat()
+    assert client.put(f"/api/cards/{card_id}/due", json={"due": future}).status_code == 200
+    assert all(
+        c["card_id"] != card_id for c in client.get("/api/next").json()["cards"]
+    )
+    assert client.put(f"/api/cards/{card_id}/due", json={"due": "not-a-date"}).status_code == 400
+
+
+def test_browse_assigns_persistent_card_numbers(client, tmp_path):
+    register(client)
+    apkg = make_apkg(tmp_path)
+    with open(apkg, "rb") as f:
+        assert (
+            client.post(
+                "/api/import", files={"file": ("test.apkg", f, "application/zip")}
+            ).status_code
+            == 201
+        )
+    deck_id = client.get("/api/decks").json()["decks"][0]["id"]
+    first = client.get(f"/api/decks/{deck_id}/cards?limit=100").json()["cards"]
+    numbers = [r["card_number"] for r in first]
+    assert all(isinstance(n, int) for n in numbers)
+    assert len(set(numbers)) == len(numbers)
+    # Numbers persist across reads and grow for newly written cards.
+    deck = client.get("/api/decks").json()["decks"][0]
+    res = client.post(
+        "/api/cards",
+        json={"deck_id": deck["id"], "front": "New Q", "back": "New A"},
+    )
+    assert res.status_code == 201, res.text
+    second = {
+        r["card_id"]: r["card_number"]
+        for r in client.get(f"/api/decks/{deck_id}/cards?limit=100").json()["cards"]
+    }
+    for r in first:
+        assert second[r["card_id"]] == r["card_number"]
+    assert second[res.json()["card_id"]] == max(numbers) + 1
+
+
+def test_export_round_trips_through_import(client, tmp_path):
+    register(client)
+    apkg = make_apkg(tmp_path)
+    with open(apkg, "rb") as f:
+        assert (
+            client.post(
+                "/api/import", files={"file": ("test.apkg", f, "application/zip")}
+            ).status_code
+            == 201
+        )
+    deck_id = client.get("/api/decks").json()["decks"][0]["id"]
+    res = client.get(f"/api/export?deck_ids={deck_id}")
+    assert res.status_code == 200, res.text
+    assert res.headers["content-type"] == "application/octet-stream"
+    assert res.headers["content-disposition"].endswith('.apkg"')
+    out = tmp_path / "exported.apkg"
+    out.write_bytes(res.content)
+    from smarthole import apkg_import
+
+    parsed = apkg_import.parse_apkg(str(out))
+    assert sum(len(d.cards) for d in parsed.decks) == 2
+    assert parsed.decks[0].name == "Test"
+
+
+def test_stats_reports_added_per_day(client, tmp_path):
+    register(client)
+    apkg = make_apkg(tmp_path)
+    with open(apkg, "rb") as f:
+        assert (
+            client.post(
+                "/api/import", files={"file": ("test.apkg", f, "application/zip")}
+            ).status_code
+            == 201
+        )
+    stats = client.get("/api/stats").json()
+    assert len(stats["added_per_day"]) == 30
+    assert sum(d["added"] for d in stats["added_per_day"]) == 2
+    assert stats["added_per_day"][-1]["added"] == 2

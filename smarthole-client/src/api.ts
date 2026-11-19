@@ -357,9 +357,11 @@ export type BrowseDir = 'asc' | 'desc';
 
 export interface BrowseCard {
   card_id: string;
+  card_number?: number | null;
   front_text: string;
   due: string | null;
   last_review: string | null;
+  created_at?: string | null;
   state: string;
   reps: number;
   suspended: boolean;
@@ -380,14 +382,70 @@ export async function browseCards(
   search?: string,
   showDeleted = false,
   mcpOnly = false,
+  suspendedOnly = false,
 ): Promise<{ cards: BrowseCard[]; total: number }> {
   let q =
     `?sort=${sort}&direction=${direction}&skip=${skip}&limit=${limit}`;
   if (search) q += `&q=${encodeURIComponent(search)}`;
   if (showDeleted) q += '&show_deleted=true';
   if (mcpOnly) q += '&mcp_only=true';
+  if (suspendedOnly) q += '&suspended_only=true';
   const res = await apiFetch(`/decks/${encodeURIComponent(deckId)}/cards${q}`);
   return readJson(res);
+}
+
+/** Suspend a card (stays in Browse, leaves the review queue). */
+export async function suspendCard(cardId: string): Promise<void> {
+  const res = await apiFetch(`/cards/${encodeURIComponent(cardId)}/suspend`, {
+    method: 'POST',
+    body: JSON.stringify({}),
+  });
+  await readJson(res);
+}
+
+/** Return a suspended card to the review queue. */
+export async function unsuspendCard(cardId: string): Promise<void> {
+  const res = await apiFetch(`/cards/${encodeURIComponent(cardId)}/unsuspend`, {
+    method: 'POST',
+    body: JSON.stringify({}),
+  });
+  await readJson(res);
+}
+
+/** Reschedule a card by setting its due date (ISO datetime string). */
+export async function setCardDue(
+  cardId: string,
+  due: string,
+): Promise<{ card_id: string; due: string }> {
+  const res = await apiFetch(`/cards/${encodeURIComponent(cardId)}/due`, {
+    method: 'PUT',
+    body: JSON.stringify({ due }),
+  });
+  return readJson(res);
+}
+
+/** Download an .apkg export of one or more decks. */
+export async function exportDecks(deckIds: string[]): Promise<void> {
+  const q = `?deck_ids=${encodeURIComponent(deckIds.join(','))}`;
+  const res = await fetch(`/api/export${q}`, {
+    credentials: 'same-origin',
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => res.statusText);
+    throw new Error(text || `Request failed: ${res.status}`);
+  }
+  const blob = await res.blob();
+  const name =
+    /filename="([^"]+)"/.exec(res.headers.get('content-disposition') ?? '')?.[1] ??
+    'smarthole-export.apkg';
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = name;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 5000);
 }
 
 export async function createCard(
@@ -491,6 +549,7 @@ export interface Stats {
     accuracy: number | null;
   };
   forecast: Array<{ date: string; due: number }>;
+  added_per_day?: Array<{ date: string; added: number }>;
 }
 
 export async function getStats(): Promise<Stats> {
@@ -521,7 +580,11 @@ const MONTHS = [
  */
 /**
  * Human interval from now until an ISO due timestamp, Anki-style:
- * "10m", "3h", "23d", "4mo", "2y". Empty string when unknown.
+ * "10m", "3h", "23d", "1.3mo", "2y". Empty string when unknown.
+ *
+ * Months and years keep one decimal (trailing ".0" trimmed) so nearby
+ * grades stay distinguishable: flooring to whole months collapses
+ * genuinely different due dates (e.g. 39d and 47d) into one label.
  */
 export function fmtInterval(iso: string | null | undefined): string {
   if (!iso) return '';
@@ -531,11 +594,17 @@ export function fmtInterval(iso: string | null | undefined): string {
   if (mins < 60) return `${mins}m`;
   const hours = Math.floor(mins / 60);
   if (hours < 24) return `${hours}h`;
-  const days = Math.floor(hours / 24);
-  if (days < 30) return `${days}d`;
-  const months = Math.floor(days / 30.44);
-  if (months < 12) return `${months}mo`;
-  return `${Math.floor(months / 12)}y`;
+  const daysExact = hours / 24;
+  if (daysExact < 30) return `${Math.floor(daysExact)}d`;
+  const monthsExact = daysExact / 30.44;
+  if (monthsExact < 12) return `${trim1(monthsExact)}mo`;
+  return `${trim1(monthsExact / 12)}y`;
+}
+
+/** One decimal, dropping a trailing ".0" ("2.0" -> "2"). */
+function trim1(n: number): string {
+  const rounded = Math.round(n * 10) / 10;
+  return String(rounded);
 }
 
 export function fmtDate(iso: string | null | undefined): string {
