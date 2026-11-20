@@ -18,7 +18,9 @@ connectors / Apps, MCP Inspector, Claude Code, Cursor, …). Pattern mirrors
 | Tool | Source | Scope |
 |---|---|---|
 | `list_decks()` | caller's decks with card counts | `cards:read` |
-| `propose_cards(deck_id, cards)` | propose final cards, renders checkbox widget (no writes) | `cards:write` |
+| `list_cards(deck_id, query?, limit?)` | view existing cards (substring filter, newest first) | `cards:read` |
+| `find_similar_cards(text?/card_id?, deck_id?, limit?)` | embedding similarity search over existing cards | `cards:read` |
+| `propose_cards(deck_id, cards)` | propose cards (final, draft, or partial), renders checkbox widget (no writes) | `cards:write` |
 | `create_cards(deck_id, cards)` | create the widget's ticked boxes (FSRS-new, flagged MCP-created) | `cards:write` |
 | `create_card(deck_id, front, back)` | legacy direct create (no widget); prefer `propose_cards` | `cards:write` |
 

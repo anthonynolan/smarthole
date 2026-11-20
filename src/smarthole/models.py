@@ -151,6 +151,20 @@ class CardState(Document):
     new_position = IntField(default=0)  # Anki new-order, for DB-side sorting
 
 
+class Feedback(Document):
+    """User feedback about the app (status starts at "submitted")."""
+
+    meta = {"collection": "feedback", "indexes": ["user", "status", "created_at"]}
+
+    user = ReferenceField(User, required=True)
+    email = StringField(required=True)  # snapshot for admin filtering
+    username = StringField()  # User.name snapshot, may be empty
+    text = StringField(required=True)
+    screen = StringField()  # where the feedback was given, if known
+    status = StringField(required=True, default="submitted")
+    created_at = DateTimeField(default=utcnow)
+
+
 class Review(Document):
     meta = {"collection": "reviews", "indexes": ["user", "card", "reviewed_at"]}
 

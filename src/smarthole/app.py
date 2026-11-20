@@ -51,9 +51,31 @@ from .auth import (
     verify_google_token,
     verify_password,
 )
-from .models import Card, CardState, Deck, Media, Review, User
+from .models import Card, CardState, Deck, Feedback, Media, Review, User
 from .models import ensure_card_number as _ensure_card_number
 from .models import next_card_number as _next_card_number
+
+
+def _admin_emails() -> set[str]:
+    raw = os.getenv("ADMIN_EMAILS", "anthonynolan@gmail.com")
+    return {e.strip().lower() for e in raw.split(",") if e.strip()}
+
+
+def _require_admin(user: User) -> None:
+    if (user.email or "").lower() not in _admin_emails():
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Admin only")
+
+
+def _feedback_row(f: Feedback) -> dict:
+    return {
+        "id": str(f.id),
+        "email": f.email,
+        "username": f.username or "",
+        "text": f.text,
+        "screen": f.screen or "",
+        "status": f.status,
+        "created_at": f.created_at.isoformat() if f.created_at else None,
+    }
 
 STATIC_DIR = Path(__file__).parent / "static"
 CLIENT_DIST = Path(__file__).resolve().parents[2] / "smarthole-client" / "dist"
@@ -88,12 +110,28 @@ class AiReviewBody(BaseModel):
     question: str | None = None
 
 
+class FeedbackBody(BaseModel):
+    text: str
+    screen: str | None = None
+
+
+class FeedbackStatusBody(BaseModel):
+    status: str
+
+
+FEEDBACK_STATUSES = ("submitted", "in_progress", "resolved")
+
+
 class GoogleBody(BaseModel):
     token: str
 
 
 def utcnow() -> datetime:
     return datetime.now(UTC)
+
+
+# Process start (UTC): the honest proxy for "last server deploy/restart".
+SERVER_STARTED_AT = utcnow()
 
 
 def _related_min_score() -> float:
@@ -387,7 +425,9 @@ def create_app() -> FastAPI:
     @app.get("/api/decks/{deck_id}/cards")
     def browse_deck(
         deck_id: str,
-        sort: Literal["due", "last_review"] = Query(default="due"),
+        sort: Literal["due", "last_review", "created_at", "card_number"] = Query(
+            default="due"
+        ),
         direction: Literal["asc", "desc"] = Query(default="asc"),
         skip: int = Query(default=0, ge=0),
         limit: int = Query(default=20, ge=1, le=100),
@@ -422,10 +462,19 @@ def create_app() -> FastAPI:
         # ids only: never materialize full Card documents (HTML + embedding
         # vectors) for the whole deck to serve one page of rows.
         card_ids = list(cards_query.values_list("id"))
-        total = (
-            CardState.objects(user=user, card__in=card_ids).count() if card_ids else 0
-        )
-        states = _paged_states(user, card_ids, sort, direction, skip, limit)
+        if sort in ("created_at", "card_number"):
+            # Card-field sorts page the cards first (nulls last), then load
+            # the matching states in that order.
+            states, total = _paged_states_by_card_field(
+                user, cards_query, card_ids, sort, direction, skip, limit
+            )
+        else:
+            total = (
+                CardState.objects(user=user, card__in=card_ids).count()
+                if card_ids
+                else 0
+            )
+            states = _paged_states(user, card_ids, sort, direction, skip, limit)
         # Reuse the dereferenced page cards directly: the old
         # Card.objects(id__in=[s.card.id ...]) lookup re-fetched the same
         # documents a second time.
@@ -1164,6 +1213,128 @@ def create_app() -> FastAPI:
             "added_per_day": added_per_day,
         }
 
+    @app.get("/api/build-info")
+    def build_info(user: User = Depends(get_current_user)):
+        """When the server last (re)started and from which commit.
+
+        Process start is the honest proxy for "last deploy": every deploy
+        restarts uvicorn. The UI build time is baked into the client bundle.
+        """
+        return {
+            "server_started_at": SERVER_STARTED_AT.isoformat(),
+            "server_git_sha": _git_sha(),
+        }
+
+    @app.post("/api/feedback", status_code=201)
+    def submit_feedback(body: FeedbackBody, user: User = Depends(get_current_user)):
+        """Submit app feedback; every item starts with status "submitted"."""
+        text = (body.text or "").strip()
+        if not text:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST, "Feedback text must be non-empty"
+            )
+        fb = Feedback(
+            user=user,
+            email=user.email,
+            username=user.name or "",
+            text=text,
+            screen=(body.screen or "").strip(),
+            status="submitted",
+        ).save()
+        return _feedback_row(fb)
+
+    @app.get("/api/feedback")
+    def list_own_feedback(user: User = Depends(get_current_user)):
+        """The caller's own feedback, newest first."""
+        items = Feedback.objects(user=user).order_by("-created_at")
+        return {"feedback": [_feedback_row(f) for f in items]}
+
+    @app.get("/api/feedback/all")
+    def list_all_feedback(
+        status: str | None = Query(default=None),
+        email: str | None = Query(default=None),
+        user: User = Depends(get_current_user),
+    ):
+        """Everyone's feedback (admin): filter by status and/or user email."""
+        _require_admin(user)
+        query = Feedback.objects
+        if status:
+            if status not in FEEDBACK_STATUSES:
+                raise HTTPException(
+                    status.HTTP_400_BAD_REQUEST,
+                    f"status must be one of {', '.join(FEEDBACK_STATUSES)}",
+                )
+            query = query.filter(status=status)
+        if email and email.strip():
+            query = query.filter(email__icontains=email.strip())
+        items = query.order_by("-created_at")
+        return {"feedback": [_feedback_row(f) for f in items]}
+
+    @app.patch("/api/feedback/{fb_id}")
+    def update_feedback_status(
+        fb_id: str, body: FeedbackStatusBody, user: User = Depends(get_current_user)
+    ):
+        """Change a feedback item's status (admin)."""
+        _require_admin(user)
+        if body.status not in FEEDBACK_STATUSES:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                f"status must be one of {', '.join(FEEDBACK_STATUSES)}",
+            )
+        try:
+            fb = Feedback.objects(id=fb_id).first()
+        except Exception:
+            fb = None
+        if fb is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Feedback not found")
+        fb.update(set__status=body.status)
+        fb.reload()
+        return _feedback_row(fb)
+
+    @app.get("/api/feedback/export")
+    def export_feedback(
+        status: str | None = Query(default=None),
+        email: str | None = Query(default=None),
+        user: User = Depends(get_current_user),
+    ):
+        """Download the filtered feedback set as CSV (admin)."""
+        import csv
+        import io
+
+        _require_admin(user)
+        query = Feedback.objects
+        if status:
+            if status not in FEEDBACK_STATUSES:
+                raise HTTPException(
+                    status.HTTP_400_BAD_REQUEST,
+                    f"status must be one of {', '.join(FEEDBACK_STATUSES)}",
+                )
+            query = query.filter(status=status)
+        if email and email.strip():
+            query = query.filter(email__icontains=email.strip())
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+        writer.writerow(
+            ["id", "email", "username", "status", "screen", "created_at", "text"]
+        )
+        for f in query.order_by("-created_at"):
+            writer.writerow(
+                [
+                    str(f.id),
+                    f.email,
+                    f.username or "",
+                    f.status,
+                    f.screen or "",
+                    f.created_at.isoformat() if f.created_at else "",
+                    f.text,
+                ]
+            )
+        return Response(
+            content=buf.getvalue(),
+            media_type="text/csv",
+            headers={"content-disposition": 'attachment; filename="feedback.csv"'},
+        )
+
     @app.get("/media/{sha}")
     def serve_media(sha: str):
         item = Media.objects(sha256=sha).first()
@@ -1273,11 +1444,30 @@ def _day_start() -> datetime:
     return utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
 
 
+def _git_sha() -> str | None:
+    """Short HEAD sha of this checkout, or None when unavailable."""
+    import subprocess
+
+    try:
+        repo = Path(__file__).resolve().parents[2]
+        out = subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "--short", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        sha = (out.stdout or "").strip()
+        return sha or None
+    except Exception:
+        return None
+
+
 def _export_apkg(decks, out_path: str) -> None:
     """Write the given decks' non-deleted cards to an .apkg file.
 
     Uses Anki's own backend (same package the importer uses) so the file
-    re-imports cleanly: one Basic note per card, Front/Back as stored HTML.
+    re-imports cleanly: one Basic note per card, Front/Back as stored HTML,
+    minus the Anki ``{{FrontSide}}`` echo at the start of the answer side.
     """
     from anki.collection import Collection, ExportAnkiPackageOptions
 
@@ -1292,7 +1482,9 @@ def _export_apkg(decks, out_path: str) -> None:
             for card in Card.objects(deck=deck, deleted__ne=True):
                 note = col.new_note(basic)
                 note["Front"] = card.front_html or ""
-                note["Back"] = card.back_html or ""
+                note["Back"] = strip_front_echo(
+                    card.front_html or "", card.back_html or ""
+                )
                 col.add_note(note, did)
         options = ExportAnkiPackageOptions(
             with_scheduling=False, with_deck_configs=False, with_media=False
@@ -1337,6 +1529,35 @@ def _new_queue(user: User, cards: dict, count: int) -> list[CardState]:
         .order_by("new_position", "id")
         .limit(min(count, budget))
     )
+
+
+def _paged_states_by_card_field(
+    user: User,
+    cards_query,
+    card_ids: list,
+    field: str,
+    direction: str,
+    skip: int,
+    limit: int,
+) -> tuple[list[CardState], int]:
+    """One page of states ordered by a Card field, nulls always last.
+
+    Only (id, field) pairs are loaded for the whole deck — never the full
+    Card documents — then the page's states are fetched in that order.
+    """
+    reverse = direction == "desc"
+    pairs = list(cards_query.values_list("id", field))
+    present = [(cid, val) for cid, val in pairs if val is not None]
+    missing = [cid for cid, val in pairs if val is None]
+    present.sort(key=lambda p: p[1], reverse=reverse)
+    ordered_ids = [cid for cid, _ in present] + missing
+    total = CardState.objects(user=user, card__in=card_ids).count() if card_ids else 0
+    page_ids = ordered_ids[skip : skip + limit]
+    by_card = {}
+    if page_ids:
+        for s in CardState.objects(user=user, card__in=page_ids):
+            by_card[s.card.id] = s
+    return [by_card[pid] for pid in page_ids if pid in by_card], total
 
 
 def _paged_states(

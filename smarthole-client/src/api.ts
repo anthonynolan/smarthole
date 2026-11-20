@@ -352,7 +352,7 @@ export function htmlToText(html: string): string {
     .trim();
 }
 
-export type BrowseSort = 'due' | 'last_review';
+export type BrowseSort = 'due' | 'last_review' | 'created_at' | 'card_number';
 export type BrowseDir = 'asc' | 'desc';
 
 export interface BrowseCard {
@@ -605,6 +605,125 @@ export function fmtInterval(iso: string | null | undefined): string {
 function trim1(n: number): string {
   const rounded = Math.round(n * 10) / 10;
   return String(rounded);
+}
+
+export type FeedbackStatus = 'submitted' | 'in_progress' | 'resolved';
+
+export interface FeedbackItem {
+  id: string;
+  email: string;
+  username: string;
+  text: string;
+  screen: string;
+  status: FeedbackStatus;
+  created_at: string | null;
+}
+
+/** Submit app feedback (starts with status "submitted"). */
+export async function submitFeedback(
+  text: string,
+  screen?: string,
+): Promise<FeedbackItem> {
+  const res = await apiFetch('/feedback', {
+    method: 'POST',
+    body: JSON.stringify({ text, screen: screen ?? '' }),
+  });
+  return readJson(res);
+}
+
+/** The caller's own feedback, newest first. */
+export async function getOwnFeedback(): Promise<FeedbackItem[]> {
+  const res = await apiFetch('/feedback');
+  const data = await readJson(res);
+  return data.feedback ?? [];
+}
+
+export interface FeedbackFilter {
+  status?: string;
+  email?: string;
+}
+
+/**
+ * Everyone's feedback (admin only; 403 otherwise). Filter by status
+ * and/or user email.
+ */
+export async function getAllFeedback(
+  filter?: FeedbackFilter,
+): Promise<FeedbackItem[]> {
+  let q = '';
+  if (filter?.status) q += `?status=${encodeURIComponent(filter.status)}`;
+  if (filter?.email) q += `${q ? '&' : '?'}email=${encodeURIComponent(filter.email)}`;
+  const res = await apiFetch(`/feedback/all${q}`);
+  const data = await readJson(res);
+  return data.feedback ?? [];
+}
+
+/** Change a feedback item's status (admin only). */
+export async function setFeedbackStatus(
+  id: string,
+  status: FeedbackStatus,
+): Promise<FeedbackItem> {
+  const res = await apiFetch(`/feedback/${encodeURIComponent(id)}`, {
+    method: 'PATCH',
+    body: JSON.stringify({ status }),
+  });
+  return readJson(res);
+}
+
+/** Download the filtered feedback set as CSV (admin only). */
+export async function exportFeedback(filter?: FeedbackFilter): Promise<void> {
+  let q = '';
+  if (filter?.status) q += `?status=${encodeURIComponent(filter.status)}`;
+  if (filter?.email) q += `${q ? '&' : '?'}email=${encodeURIComponent(filter.email)}`;
+  const res = await fetch(`/api/feedback/export${q}`, {
+    credentials: 'same-origin',
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => res.statusText);
+    throw new Error(text || `Request failed: ${res.status}`);
+  }
+  const blob = await res.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'feedback.csv';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 5000);
+}
+
+export interface BuildInfo {
+  server_started_at: string;
+  server_git_sha: string | null;
+}
+
+/** When the server last restarted, and from which commit. */
+export async function getBuildInfo(): Promise<BuildInfo> {
+  const res = await apiFetch('/build-info');
+  return readJson(res);
+}
+
+/**
+ * When this UI bundle was built (baked in at build time by vite.config.ts;
+ * "dev" for unbuilt dev servers).
+ */
+export const UI_BUILD_AT: string =
+  typeof __UI_BUILD_TIME__ !== 'undefined' ? __UI_BUILD_TIME__ : 'dev';
+
+declare const __UI_BUILD_TIME__: string;
+
+/**
+ * Date and time like "12-Nov'26 14:05 UTC" ("dev" passes through, em dash
+ * when missing). Used for deploy/build stamps.
+ */
+export function fmtDateTime(iso: string | null | undefined): string {
+  if (iso === 'dev') return 'dev';
+  if (!iso) return '—';
+  const dt = new Date(iso);
+  if (Number.isNaN(dt.getTime())) return '—';
+  const p = (n: number) => String(n).padStart(2, '0');
+  return `${fmtDate(iso)} ${p(dt.getUTCHours())}:${p(dt.getUTCMinutes())} UTC`;
 }
 
 export function fmtDate(iso: string | null | undefined): string {

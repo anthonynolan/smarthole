@@ -38,9 +38,11 @@ import {
   TableContainer,
   TableHead,
   TableRow,
+  TableSortLabel,
   TextField,
   Toolbar,
   Typography,
+  useMediaQuery,
 } from '@mui/material';
 import { createTheme, ThemeProvider, type SxProps, type Theme } from '@mui/material/styles';
 import CssBaseline from '@mui/material/CssBaseline';
@@ -51,6 +53,7 @@ import {
   createCard,
   deleteCard,
   fmtDate,
+  fmtDateTime,
   fmtInterval,
   getCard,
   getDecks,
@@ -72,20 +75,32 @@ import {
   suspendCard,
   unsuspendCard,
   exportDecks,
+  exportFeedback,
+  getAllFeedback,
+  getBuildInfo,
+  getOwnFeedback,
+  setFeedbackStatus,
+  submitFeedback,
   updateCard,
   htmlToText,
+  UI_BUILD_AT,
   type AiReviewMode,
   type AiReviewStatus,
   type AiSuggestion,
   type BrowseCard,
+  type BrowseDir,
+  type BrowseSort,
+  type BuildInfo,
   type CardMeta,
   type Deck,
+  type FeedbackItem,
+  type FeedbackStatus,
   type RelatedCard,
   type ReviewCard,
   type Stats,
 } from './api';
 
-type View = 'review' | 'browse' | 'add' | 'import' | 'stats';
+type View = 'review' | 'browse' | 'add' | 'import' | 'stats' | 'feedback';
 
 const theme = createTheme({
   typography: {
@@ -244,6 +259,15 @@ export default function App() {
           <Typography variant="h6" sx={{ flexGrow: 1 }}>
             Smarthole
           </Typography>
+          <Button
+            color="inherit"
+            onClick={() => {
+              setView('feedback');
+              setDrawerOpen(false);
+            }}
+          >
+            Feedback
+          </Button>
           <Typography variant="body2">{me}</Typography>
         </Toolbar>
       </AppBar>
@@ -294,6 +318,15 @@ export default function App() {
           >
             <ListItemText primary="Stats" />
           </ListItemButton>
+          <ListItemButton
+            selected={view === 'feedback'}
+            onClick={() => {
+              setView('feedback');
+              setDrawerOpen(false);
+            }}
+          >
+            <ListItemText primary="Feedback" />
+          </ListItemButton>
           <ListItemButton onClick={handleLogout}>
             <ListItemText primary="Logout" />
           </ListItemButton>
@@ -305,6 +338,7 @@ export default function App() {
         {view === 'add' && <AddView />}
         {view === 'import' && <ImportView />}
         {view === 'stats' && <StatsView />}
+        {view === 'feedback' && <FeedbackView />}
       </Container>
     </Box>
   );
@@ -1260,6 +1294,9 @@ function BrowseView() {
   const [showDeleted, setShowDeleted] = useState(false);
   const [showMcpOnly, setShowMcpOnly] = useState(false);
   const [showSuspendedOnly, setShowSuspendedOnly] = useState(false);
+  const [sort, setSort] = useState<BrowseSort>('due');
+  const [direction, setDirection] = useState<BrowseDir>('asc');
+  const isMobile = useMediaQuery('(max-width:600px)');
   const [rowBusy, setRowBusy] = useState<string | null>(null);
   const [rowError, setRowError] = useState<string | null>(null);
   const [selected, setSelected] = useState<Set<string>>(new Set());
@@ -1277,9 +1314,11 @@ function BrowseView() {
   const [detailSchedBusy, setDetailSchedBusy] = useState(false);
   const [detailSchedError, setDetailSchedError] = useState<string | null>(null);
   const sentinelRef = useRef<HTMLDivElement | null>(null);
-  const stateRef = useRef({ deckId, q: '', showDeleted: false, showMcpOnly: false, showSuspendedOnly: false, loading: false, total: Infinity as number });
+  const stateRef = useRef({ deckId, sort: 'due' as BrowseSort, direction: 'asc' as BrowseDir, q: '', showDeleted: false, showMcpOnly: false, showSuspendedOnly: false, loading: false, total: Infinity as number });
   stateRef.current = {
     deckId,
+    sort,
+    direction,
     q: committedQ,
     showDeleted,
     showMcpOnly,
@@ -1314,8 +1353,8 @@ function BrowseView() {
     return () => clearTimeout(timer);
   }, [q]);
 
-  // Reset paging whenever the deck or committed search changes.
-  // Always due-date ascending: due-today rows lead the table.
+  // Reset paging whenever the deck, sort, or committed search changes.
+  // Default due-date ascending: due-today rows lead the table.
   useEffect(() => {
     setRows([]);
     setTotal(0);
@@ -1325,7 +1364,7 @@ function BrowseView() {
     let cancelled = false;
     setLoading(true);
     setRowError(null);
-    browseCards(deckId, 'due', 'asc', 0, BROWSE_PAGE, committedQ, showDeleted, showMcpOnly, showSuspendedOnly)
+    browseCards(deckId, sort, direction, 0, BROWSE_PAGE, committedQ, showDeleted, showMcpOnly, showSuspendedOnly)
       .then(({ cards, total: t }) => {
         if (cancelled) return;
         setRows(cards);
@@ -1344,7 +1383,7 @@ function BrowseView() {
     return () => {
       cancelled = true;
     };
-  }, [deckId, committedQ, showDeleted, showMcpOnly, showSuspendedOnly]);
+  }, [deckId, sort, direction, committedQ, showDeleted, showMcpOnly, showSuspendedOnly]);
 
   const reloadBrowse = useCallback(async () => {
     if (!deckId) return;
@@ -1352,14 +1391,14 @@ function BrowseView() {
     setRowError(null);
     try {
       const { cards, total: t } = await browseCards(
-        deckId, 'due', 'asc', 0, BROWSE_PAGE, committedQ, showDeleted, showMcpOnly, showSuspendedOnly,
+        deckId, sort, direction, 0, BROWSE_PAGE, committedQ, showDeleted, showMcpOnly, showSuspendedOnly,
       );
       setRows(cards);
       setTotal(t);
     } finally {
       setLoading(false);
     }
-  }, [deckId, committedQ, showDeleted, showMcpOnly, showSuspendedOnly]);
+  }, [deckId, sort, direction, committedQ, showDeleted, showMcpOnly, showSuspendedOnly]);
 
   const handleRestore = async (cardId: string) => {
     setRowError(null);
@@ -1539,8 +1578,8 @@ function BrowseView() {
       try {
         const { cards, total: t } = await browseCards(
           s.deckId,
-          'due',
-          'asc',
+          s.sort,
+          s.direction,
           rows.length,
           BROWSE_PAGE,
           s.q,
@@ -1593,14 +1632,27 @@ function BrowseView() {
         )
       : rows;
 
-  // Green divider between due-today rows (top) and everything else.
+  // Clicking a column heading sorts by it (again reverses direction).
+  const toggleSort = (field: BrowseSort) => {
+    if (sort === field) {
+      setDirection((d) => (d === 'asc' ? 'desc' : 'asc'));
+    } else {
+      setSort(field);
+      setDirection('asc');
+    }
+  };
+
+  // Green divider between due-today rows (top) and everything else. Only
+  // for the default due-date-ascending sort: any other column order keeps
+  // the server order untouched so the chosen sort is what you see.
   // Due-today rows are ordered first: the server sort is by due date, so
   // not-yet-due new cards (reps 0) can otherwise sit above due-today rows
   // and hide the divider.
-  const visibleRows = showDeleted
+  const defaultDueOrder = sort === 'due' && direction === 'asc';
+  const visibleRows = showDeleted || !defaultDueOrder
     ? searchedRows
     : [...searchedRows].sort((a, b) => Number(b.due_today) - Number(a.due_today));
-  const splitIdx = showDeleted ? -1 : visibleRows.findIndex((r) => !r.due_today);
+  const splitIdx = showDeleted || !defaultDueOrder ? -1 : visibleRows.findIndex((r) => !r.due_today);
 
   const toggleSelect = (cardId: string) =>
     setSelected((prev) => {
@@ -1731,7 +1783,33 @@ function BrowseView() {
           </Button>
         </Box>
       )}
-      <TableContainer sx={{ overflowX: 'hidden' }}>
+      {isMobile && (
+        <Box sx={{ display: 'flex', gap: 1, mb: 1 }}>
+          <FormControl size="small" sx={{ flexGrow: 1 }}>
+            <InputLabel id="browse-sort-label">Sort by</InputLabel>
+            <Select
+              labelId="browse-sort-label"
+              label="Sort by"
+              value={sort}
+              onChange={(e) => toggleSort(e.target.value as BrowseSort)}
+            >
+              <MenuItem value="due">Due</MenuItem>
+              <MenuItem value="last_review">Last reviewed</MenuItem>
+              <MenuItem value="created_at">Created</MenuItem>
+              <MenuItem value="card_number">Card #</MenuItem>
+            </Select>
+          </FormControl>
+          <Button
+            variant="outlined"
+            size="small"
+            aria-label={direction === 'asc' ? 'Sort ascending' : 'Sort descending'}
+            onClick={() => setDirection((d) => (d === 'asc' ? 'desc' : 'asc'))}
+          >
+            {direction === 'asc' ? '↑' : '↓'}
+          </Button>
+        </Box>
+      )}
+      <TableContainer sx={{ overflowX: 'hidden', display: isMobile ? 'none' : undefined }}>
         <Table size="small" sx={{ tableLayout: 'fixed', width: '100%' }}>
           <TableHead>
             <TableRow>
@@ -1744,13 +1822,43 @@ function BrowseView() {
                   disabled={visibleRows.length === 0}
                 />
               </TableCell>
-              <TableCell sx={{ width: '2.5rem', textAlign: 'right' }}>#</TableCell>
-              <TableCell>Question</TableCell>
-              <TableCell sx={{ width: '8.5rem', fontWeight: 'bold' }}>Due</TableCell>
-              <TableCell sx={{ width: '8.5rem', fontWeight: 'bold' }}>
-                Last reviewed
+              <TableCell sx={{ width: '2.5rem', textAlign: 'right' }} sortDirection={sort === 'card_number' ? direction : false}>
+                <TableSortLabel
+                  active={sort === 'card_number'}
+                  direction={sort === 'card_number' ? direction : 'asc'}
+                  onClick={() => toggleSort('card_number')}
+                >
+                  #
+                </TableSortLabel>
               </TableCell>
-              <TableCell sx={{ width: '8.5rem', fontWeight: 'bold' }}>Created</TableCell>
+              <TableCell>Question</TableCell>
+              <TableCell sx={{ width: '8.5rem', fontWeight: 'bold' }} sortDirection={sort === 'due' ? direction : false}>
+                <TableSortLabel
+                  active={sort === 'due'}
+                  direction={sort === 'due' ? direction : 'asc'}
+                  onClick={() => toggleSort('due')}
+                >
+                  Due
+                </TableSortLabel>
+              </TableCell>
+              <TableCell sx={{ width: '8.5rem', fontWeight: 'bold' }} sortDirection={sort === 'last_review' ? direction : false}>
+                <TableSortLabel
+                  active={sort === 'last_review'}
+                  direction={sort === 'last_review' ? direction : 'asc'}
+                  onClick={() => toggleSort('last_review')}
+                >
+                  Last reviewed
+                </TableSortLabel>
+              </TableCell>
+              <TableCell sx={{ width: '8.5rem', fontWeight: 'bold' }} sortDirection={sort === 'created_at' ? direction : false}>
+                <TableSortLabel
+                  active={sort === 'created_at'}
+                  direction={sort === 'created_at' ? direction : 'asc'}
+                  onClick={() => toggleSort('created_at')}
+                >
+                  Created
+                </TableSortLabel>
+              </TableCell>
               <TableCell sx={{ width: '5rem', fontWeight: 'bold' }}>Susp.</TableCell>
               {showDeleted && (
                 <TableCell sx={{ width: '12rem', fontWeight: 'bold' }}>Actions</TableCell>
@@ -1829,6 +1937,74 @@ function BrowseView() {
           </TableBody>
         </Table>
       </TableContainer>
+      {isMobile && (
+        <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
+          {visibleRows.map((r) => (
+            <Paper
+              key={r.card_id}
+              onClick={() => setDetailId(r.card_id)}
+              sx={{ p: 1.5, cursor: 'pointer' }}
+            >
+              <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 0.5 }}>
+                <Checkbox
+                  inputProps={{ 'aria-label': `Select card ${r.card_number ?? ''}` }}
+                  checked={selected.has(r.card_id)}
+                  onChange={() => toggleSelect(r.card_id)}
+                  onClick={(e) => e.stopPropagation()}
+                  size="small"
+                  sx={{ p: 0.5 }}
+                />
+                <Typography variant="body2" sx={{ fontWeight: 600 }}>
+                  #{r.card_number ?? '—'}
+                </Typography>
+                <Box sx={{ flexGrow: 1 }} />
+                {r.suspended && (
+                  <Typography variant="caption" color="text.secondary">
+                    Suspended
+                  </Typography>
+                )}
+              </Box>
+              <Typography
+                variant="body1"
+                sx={{ whiteSpace: 'normal', overflowWrap: 'break-word' }}
+              >
+                {r.front_text}
+              </Typography>
+              <Typography variant="caption" color="text.secondary">
+                Due {fmtDate(r.due)} · Reviewed {fmtDate(r.last_review)} · Created{' '}
+                {fmtDate(r.created_at ?? null)}
+              </Typography>
+              {showDeleted && (
+                <Box sx={{ display: 'flex', gap: 1, mt: 1, flexWrap: 'wrap' }}>
+                  <Button
+                    size="small"
+                    variant="outlined"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      void handleRestore(r.card_id);
+                    }}
+                    disabled={rowBusy === r.card_id}
+                  >
+                    Restore
+                  </Button>
+                  <Button
+                    size="small"
+                    variant="outlined"
+                    color="error"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      void handlePermanentDelete(r.card_id);
+                    }}
+                    disabled={rowBusy === r.card_id}
+                  >
+                    Delete forever
+                  </Button>
+                </Box>
+              )}
+            </Paper>
+          ))}
+        </Box>
+      )}
       {loading && (
         <Box sx={{ textAlign: 'center', py: 1 }}>
           <CircularProgress size={20} aria-label="loading more cards" />
@@ -2184,11 +2360,13 @@ function ImportView() {
 function StatsView() {
   const [stats, setStats] = useState<Stats | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [buildInfo, setBuildInfo] = useState<BuildInfo | null>(null);
 
   useEffect(() => {
     getStats().then(setStats, (e) =>
       setError(e instanceof Error ? e.message : String(e)),
     );
+    getBuildInfo().then(setBuildInfo, () => undefined);
   }, []);
 
   if (error) {
@@ -2225,12 +2403,14 @@ function StatsView() {
       </Box>
       <Typography variant="h6">Due forecast</Typography>
       <Box
+        data-testid="due-forecast-chart"
         sx={{
           display: 'flex',
           alignItems: 'flex-end',
-          gap: 1,
-          height: 190,
-          overflowX: 'auto',
+          gap: '2px',
+          height: 220,
+          width: '100%',
+          overflowX: 'hidden',
           pb: 1,
         }}
       >
@@ -2238,25 +2418,37 @@ function StatsView() {
           <Box
             key={f.date}
             sx={{
+              flex: '1 1 0',
+              minWidth: 0,
               display: 'flex',
               flexDirection: 'column',
               alignItems: 'center',
               justifyContent: 'flex-end',
-              minWidth: 40,
               height: '100%',
             }}
             title={`${fmtDate(f.date)}: ${f.due} due`}
           >
-            <Typography variant="caption">{f.due || ''}</Typography>
+            <Typography variant="caption" sx={{ fontSize: '0.65rem' }}>{f.due || ''}</Typography>
             <Box
               sx={{
-                width: 22,
+                width: '60%',
+                maxWidth: 16,
                 height: `${Math.max(f.due > 0 ? 8 : 2, (f.due / maxDue) * 120)}px`,
                 bgcolor: 'primary.main',
                 borderRadius: '4px 4px 0 0',
               }}
             />
-            <Typography variant="caption" color="text.secondary">
+            <Typography
+              color="text.secondary"
+              sx={{
+                writingMode: 'vertical-rl',
+                fontSize: '0.6rem',
+                lineHeight: 1,
+                height: 64,
+                mt: 0.5,
+                whiteSpace: 'nowrap',
+              }}
+            >
               {fmtDate(f.date)}
             </Typography>
           </Box>
@@ -2266,12 +2458,14 @@ function StatsView() {
         <>
           <Typography variant="h6">Cards added per day</Typography>
           <Box
+            data-testid="added-per-day-chart"
             sx={{
               display: 'flex',
               alignItems: 'flex-end',
-              gap: 1,
-              height: 190,
-              overflowX: 'auto',
+              gap: '2px',
+              height: 220,
+              width: '100%',
+              overflowX: 'hidden',
               pb: 1,
             }}
           >
@@ -2279,25 +2473,37 @@ function StatsView() {
               <Box
                 key={d.date}
                 sx={{
+                  flex: '1 1 0',
+                  minWidth: 0,
                   display: 'flex',
                   flexDirection: 'column',
                   alignItems: 'center',
                   justifyContent: 'flex-end',
-                  minWidth: 40,
                   height: '100%',
                 }}
                 title={`${fmtDate(d.date)}: ${d.added} added`}
               >
-                <Typography variant="caption">{d.added || ''}</Typography>
+                <Typography variant="caption" sx={{ fontSize: '0.65rem' }}>{d.added || ''}</Typography>
                 <Box
                   sx={{
-                    width: 22,
+                    width: '60%',
+                    maxWidth: 16,
                     height: `${Math.max(d.added > 0 ? 8 : 2, (d.added / maxAdded) * 120)}px`,
                     bgcolor: 'secondary.main',
                     borderRadius: '4px 4px 0 0',
                   }}
                 />
-                <Typography variant="caption" color="text.secondary">
+                <Typography
+                  color="text.secondary"
+                  sx={{
+                    writingMode: 'vertical-rl',
+                    fontSize: '0.6rem',
+                    lineHeight: 1,
+                    height: 64,
+                    mt: 0.5,
+                    whiteSpace: 'nowrap',
+                  }}
+                >
                   {fmtDate(d.date)}
                 </Typography>
               </Box>
@@ -2305,6 +2511,255 @@ function StatsView() {
           </Box>
         </>
       )}
+      <Typography variant="caption" color="text.secondary" data-testid="build-info">
+        {buildInfo
+          ? `Server deployed ${fmtDateTime(buildInfo.server_started_at)}${buildInfo.server_git_sha ? ` (${buildInfo.server_git_sha})` : ''} · UI built ${fmtDateTime(UI_BUILD_AT)}`
+          : `UI built ${fmtDateTime(UI_BUILD_AT)}`}
+      </Typography>
+    </Box>
+  );
+}
+
+function FeedbackView() {
+  const [text, setText] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [mine, setMine] = useState<FeedbackItem[]>([]);
+  // null = not an admin (GET /feedback/all 403s); otherwise everyone's list.
+  const [all, setAll] = useState<FeedbackItem[] | null>(null);
+  const [adminMode, setAdminMode] = useState(false);
+  const [statusFilter, setStatusFilter] = useState('');
+  const [emailFilter, setEmailFilter] = useState('');
+  const [committedEmail, setCommittedEmail] = useState('');
+  const [listError, setListError] = useState<string | null>(null);
+  const [exportBusy, setExportBusy] = useState(false);
+  const [listening, setListening] = useState(false);
+  const recRef = useRef<{ stop: () => void } | null>(null);
+
+  const speechSupported =
+    typeof window !== 'undefined' &&
+    Boolean(
+      (window as unknown as Record<string, unknown>).SpeechRecognition ||
+        (window as unknown as Record<string, unknown>).webkitSpeechRecognition,
+    );
+
+  useEffect(() => {
+    getOwnFeedback().then(setMine, () => undefined);
+    return () => {
+      try {
+        recRef.current?.stop();
+      } catch {
+        // Never mounted a recognizer: nothing to stop.
+      }
+    };
+  }, []);
+
+  // Debounce the admin email filter into a server-side query.
+  useEffect(() => {
+    const timer = setTimeout(() => setCommittedEmail(emailFilter.trim()), 350);
+    return () => clearTimeout(timer);
+  }, [emailFilter]);
+
+  // Admin list (everyone's feedback): a 403 here just means a regular user.
+  // Reloads whenever the admin filters change.
+  useEffect(() => {
+    let cancelled = false;
+    getAllFeedback({
+      ...(statusFilter ? { status: statusFilter } : {}),
+      ...(committedEmail ? { email: committedEmail } : {}),
+    }).then(
+      (items) => {
+        if (cancelled) return;
+        setAll(items);
+        setAdminMode(true);
+      },
+      (e) => {
+        if (cancelled) return;
+        if (!adminMode) {
+          setAdminMode(false);
+          return;
+        }
+        setListError(e instanceof Error ? e.message : String(e));
+      },
+    );
+    return () => {
+      cancelled = true;
+    };
+  }, [statusFilter, committedEmail]);
+
+  const toggleListen = () => {
+    if (listening) {
+      try {
+        recRef.current?.stop();
+      } finally {
+        setListening(false);
+      }
+      return;
+    }
+    const w = window as unknown as Record<string, any>;
+    const Ctor = w.SpeechRecognition || w.webkitSpeechRecognition;
+    if (!Ctor) return;
+    const rec = new Ctor();
+    rec.lang = 'en-US';
+    rec.interimResults = true;
+    rec.continuous = false;
+    rec.onresult = (e: any) => {
+      let finalText = '';
+      for (let i = e.resultIndex; i < e.results.length; i += 1) {
+        if (e.results[i].isFinal) finalText += e.results[i][0].transcript;
+      }
+      if (finalText) setText((t) => (t ? `${t} ${finalText}` : finalText));
+    };
+    rec.onend = () => setListening(false);
+    rec.onerror = () => setListening(false);
+    recRef.current = rec;
+    try {
+      rec.start();
+      setListening(true);
+    } catch {
+      setListening(false);
+    }
+  };
+
+  const submit = async () => {
+    const body = text.trim();
+    if (!body || busy) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const created = await submitFeedback(body, 'Feedback');
+      setMine((prev) => [created, ...prev]);
+      setText('');
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const changeStatus = async (id: string, status: FeedbackStatus) => {
+    setListError(null);
+    try {
+      const updated = await setFeedbackStatus(id, status);
+      setAll((prev) => (prev ? prev.map((f) => (f.id === id ? updated : f)) : prev));
+    } catch (e) {
+      setListError(e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  const doExport = async () => {
+    setExportBusy(true);
+    setListError(null);
+    try {
+      await exportFeedback({
+        ...(statusFilter ? { status: statusFilter } : {}),
+        ...(committedEmail ? { email: committedEmail } : {}),
+      });
+    } catch (e) {
+      setListError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setExportBusy(false);
+    }
+  };
+
+  const shown = all ?? mine;
+
+  return (
+    <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+      <Typography variant="h6">Give feedback</Typography>
+      <TextField
+        label="Your feedback"
+        multiline
+        fullWidth
+        minRows={4}
+        value={text}
+        onChange={(e) => setText(e.target.value)}
+        disabled={busy}
+      />
+      <Box sx={{ display: 'flex', gap: 1, flexWrap: 'wrap' }}>
+        <Button variant="contained" onClick={submit} disabled={busy || !text.trim()}>
+          {busy ? 'Sending…' : 'Submit'}
+        </Button>
+        {speechSupported && (
+          <Button variant="outlined" onClick={toggleListen}>
+            {listening ? 'Stop dictation' : 'Dictate by voice'}
+          </Button>
+        )}
+      </Box>
+      {!speechSupported && (
+        <Typography variant="caption" color="text.secondary">
+          Voice dictation is not available in this browser — type your feedback
+          instead.
+        </Typography>
+      )}
+      {error && <Alert severity="error">{error}</Alert>}
+      <Typography variant="h6">{all ? 'All feedback' : 'My feedback'}</Typography>
+      {all && (
+        <Box sx={{ display: 'flex', gap: 1, flexWrap: 'wrap', alignItems: 'center' }}>
+          <FormControl size="small" sx={{ minWidth: 140 }}>
+            <InputLabel id="feedback-status-label">Status</InputLabel>
+            <Select
+              labelId="feedback-status-label"
+              label="Status"
+              value={statusFilter}
+              onChange={(e) => setStatusFilter(e.target.value as string)}
+            >
+              <MenuItem value="">Any status</MenuItem>
+              <MenuItem value="submitted">Submitted</MenuItem>
+              <MenuItem value="in_progress">In progress</MenuItem>
+              <MenuItem value="resolved">Resolved</MenuItem>
+            </Select>
+          </FormControl>
+          <TextField
+            label="Filter by user"
+            size="small"
+            value={emailFilter}
+            onChange={(e) => setEmailFilter(e.target.value)}
+            placeholder="name or email"
+          />
+          <Button
+            variant="outlined"
+            size="small"
+            onClick={doExport}
+            disabled={exportBusy}
+          >
+            {exportBusy ? 'Exporting…' : 'Export filtered list'}
+          </Button>
+        </Box>
+      )}
+      {listError && <Alert severity="error">{listError}</Alert>}
+      {shown.length === 0 && (
+        <Typography color="text.secondary">No feedback yet.</Typography>
+      )}
+      {shown.map((f) => (
+        <Paper key={f.id} sx={{ p: 2 }}>
+          <Box sx={{ display: 'flex', gap: 1, alignItems: 'center', flexWrap: 'wrap' }}>
+            <Typography variant="subtitle1">
+              {f.username || f.email}
+            </Typography>
+            <Typography variant="caption" color="text.secondary">
+              {f.username ? `${f.email} · ` : ''}{fmtDateTime(f.created_at)} · {f.status}
+            </Typography>
+            <Box sx={{ flexGrow: 1 }} />
+            {all && (
+              <FormControl size="small" sx={{ minWidth: 130 }}>
+                <InputLabel id={`feedback-status-${f.id}`}>Status</InputLabel>
+                <Select
+                  labelId={`feedback-status-${f.id}`}
+                  label="Status"
+                  value={f.status}
+                  onChange={(e) => void changeStatus(f.id, e.target.value as FeedbackStatus)}
+                >
+                  <MenuItem value="submitted">Submitted</MenuItem>
+                  <MenuItem value="in_progress">In progress</MenuItem>
+                  <MenuItem value="resolved">Resolved</MenuItem>
+                </Select>
+              </FormControl>
+            )}
+          </Box>
+          <Typography sx={{ mt: 1, whiteSpace: 'pre-wrap' }}>{f.text}</Typography>
+        </Paper>
+      ))}
     </Box>
   );
 }

@@ -1,5 +1,5 @@
 import { expect, test } from 'vitest';
-import { fmtDate, fmtInterval } from './api';
+import { fmtDate, fmtDateTime, fmtInterval } from './api';
 
 test("fmtDate uses 12-Nov'26 style", () => {
   expect(fmtDate(null)).toBe('—');
@@ -11,6 +11,13 @@ test("fmtDate uses 12-Nov'26 style", () => {
 
 test('fmtDate keeps date-only days off the timezone shift', () => {
   expect(fmtDate('2026-11-08')).toBe("8-Nov'26");
+});
+
+test('fmtDateTime shows UTC date and time for deploy stamps', () => {
+  expect(fmtDateTime(null)).toBe('—');
+  expect(fmtDateTime('dev')).toBe('dev');
+  expect(fmtDateTime('not-a-date')).toBe('—');
+  expect(fmtDateTime('2026-11-12T14:05:00+00:00')).toBe("12-Nov'26 14:05 UTC");
 });
 
 const inFuture = (ms: number) => new Date(Date.now() + ms).toISOString();

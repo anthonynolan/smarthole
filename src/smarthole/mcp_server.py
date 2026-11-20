@@ -22,8 +22,9 @@ from mcp.server.auth.settings import AuthSettings
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 from mcp.server.fastmcp.server import TransportSecuritySettings
+from mongoengine import Q
 
-from . import apkg_import, fsrs_service
+from . import apkg_import, embeddings, fsrs_service
 from .mcp_auth import (
     CARDS_READ_SCOPE,
     CARDS_WRITE_SCOPE,
@@ -68,18 +69,20 @@ MCP_ISSUER_URL = os.getenv("MCP_ISSUER_URL", "https://smarthole.cathalanddad.com
 MCP_STATELESS = os.getenv("MCP_STATELESS", "0") == "1"
 
 MCP_INSTRUCTIONS = """Use smarthole tools for the authenticated user's Anki
-decks. For every request to add cards, follow this complete workflow without
-exception:
+decks. Use list_cards to view existing cards (and find_similar_cards for
+similarity search) before proposing anything, so you do not duplicate what
+is already there. For every request to add cards, follow this complete
+workflow without exception:
 1. Call list_decks first so you use a real deck_id (and the exact deck name
    the user asked for).
-2. Decide the final card list.
-3. Call propose_cards exactly once with that final list before finishing
-   your response. Never provide card additions as text alone;
-   propose_cards is required because it renders the selectable card UI
-   (checkboxes + select-all). The widget calls create_cards with only the
-   ticked boxes, so cards are never created in the background.
-Do not call propose_cards for drafts or partial lists. Never call
-create_card(s) directly to bypass the checkbox verification.
+2. Decide the card list — final or draft, complete or partial.
+3. Call propose_cards with that list before finishing your response, every
+   time you present cards (drafts and partial lists included). Never present
+   card additions as text alone; propose_cards is required because it renders
+   the selectable card UI (checkboxes + select-all). The widget calls
+   create_cards with only the ticked boxes, so cards are never created in
+   the background. Never call create_card(s) directly to bypass the checkbox
+   verification.
 Keep front/back short plain text or simple HTML; do not invent deck ids."""
 
 
@@ -151,6 +154,140 @@ def list_decks() -> list[dict]:
     return _call_service("list_decks", _list, user_email)
 
 
+def list_cards(
+    deck_id: str, query: str | None = None, limit: int = 50
+) -> list[dict]:
+    """View the caller's existing cards in a deck, optionally filtered by text.
+
+    Call this before proposing new cards so you do not duplicate what is
+    already there. Substring match on the front/back text, newest first.
+
+    Args:
+        deck_id: Deck id from list_decks (required).
+        query: Optional substring filter on the card text.
+        limit: Max cards to return (1-100, default 50).
+    """
+    user_email = _require_auth(CARDS_READ_SCOPE)
+    logger.info("MCP list_cards called")
+
+    def _list(email: str) -> list[dict]:
+        user = _get_user(email)
+        deck = _resolve_deck(user, deck_id)
+        cards_query = Card.objects(deck=deck, deleted__ne=True)
+        needle = (query or "").strip()
+        if needle:
+            cards_query = cards_query.filter(
+                Q(front_html__icontains=needle) | Q(back_html__icontains=needle)
+            )
+        out = []
+        for card in cards_query.order_by("-created_at").limit(
+            max(1, min(limit, 100))
+        ):
+            out.append(
+                {
+                    "card_id": str(card.id),
+                    "front_text": apkg_import.html_to_text(card.front_html or "")[
+                        :500
+                    ],
+                    "back_text": apkg_import.html_to_text(card.back_html or "")[
+                        :500
+                    ],
+                    "suspended": bool(card.suspended),
+                }
+            )
+        return out
+
+    return _call_service("list_cards", _list, user_email)
+
+
+def find_similar_cards(
+    text: str | None = None,
+    card_id: str | None = None,
+    deck_id: str | None = None,
+    limit: int = 5,
+) -> list[dict]:
+    """Similarity search over the caller's existing cards.
+
+    Give either `text` (free query) or `card_id` (cards like this one).
+    Scores at/above the server's RELATED_MIN_SCORE threshold come back
+    most-similar first. Unavailable when embeddings are not configured.
+
+    Args:
+        text: Free-text query (alternative to card_id).
+        card_id: Reference card id (alternative to text).
+        deck_id: Optional deck id from list_decks to search within.
+        limit: Max cards to return (1-20, default 5).
+    """
+    user_email = _require_auth(CARDS_READ_SCOPE)
+    logger.info("MCP find_similar_cards called")
+
+    def _find(email: str) -> list[dict]:
+        from .app import _related_min_score
+
+        user = _get_user(email)
+        if card_id:
+            try:
+                ref = Card.objects(id=card_id).first()
+            except Exception:
+                ref = None
+            if ref is None or ref.deck.owner.id != user.id or ref.deleted:
+                raise ToolError("Card not found")
+            needle_text = embeddings.card_embedding_text(
+                ref.front_html, ref.back_html
+            )
+            exclude = ref.id
+        elif (text or "").strip():
+            needle_text = text.strip()
+            exclude = None
+        else:
+            raise ToolError("Provide text or card_id to search with")
+        try:
+            query_vector, _ = embeddings.embed_text(needle_text)
+        except Exception as exc:
+            raise ToolError(
+                "Similarity search is unavailable "
+                "(embeddings or the vector index are not configured)"
+            ) from exc
+        if deck_id:
+            deck = _resolve_deck(user, deck_id)
+            deck_ids = [deck.id]
+        else:
+            deck_ids = [d.id for d in Deck.objects(owner=user)]
+        try:
+            rows = embeddings.similar_cards(
+                Card._get_collection(),
+                query_vector,
+                exclude_id=exclude,
+                deck_ids=deck_ids or None,
+                limit=max(1, min(limit, 20)),
+                min_score=_related_min_score(),
+            )
+        except Exception as exc:
+            raise ToolError(
+                "Similarity search is unavailable "
+                "(embeddings or the vector index are not configured)"
+            ) from exc
+        decks = (
+            {d.id: d for d in Deck.objects(id__in=[r["deck"] for r in rows])}
+            if rows
+            else {}
+        )
+        out = []
+        for r in rows:
+            deck = decks.get(r["deck"])
+            out.append(
+                {
+                    "card_id": str(r["_id"]),
+                    "front_text": (r.get("front_html") or "")[:500],
+                    "deck_name": deck.name if deck else "",
+                    "score": round(float(r.get("score") or 0), 4),
+                }
+            )
+        return out
+
+    return _call_service("find_similar_cards", _find, user_email)
+
+
 def _persist_card(user, deck, front: str, back: str) -> Card:
     """Create one MCP-sourced card + fresh FSRS state (no validation)."""
     existing = Card.objects(deck=deck).only("new_position")
@@ -208,13 +345,13 @@ def create_card(deck_id: str, front: str, back: str) -> CreateCardResult:
 
 
 def propose_cards(deck_id: str, cards: list[dict]) -> CardProposalResult:
-    """Present the FINAL card list as a selectable widget (call once).
+    """Present a card list as a selectable widget (call every time).
 
     After deciding the cards but before finishing your response, call this
-    with the complete final list. This call renders the checkbox widget
-    (with select-all), so its cards must exactly match the final proposal.
-    Nothing is written: the widget calls create_cards with the ticked
-    boxes. Do not call it for drafts; gather context with list_decks.
+    with the list — final, draft, or partial. This call renders the checkbox
+    widget (with select-all), so its cards must exactly match what you
+    present. Nothing is written: the widget calls create_cards with the
+    ticked boxes. Gather context with list_decks / list_cards first.
 
     Args:
         deck_id: Deck id from list_decks (required).
@@ -289,7 +426,14 @@ def card_proposal_widget() -> str:
     return get_card_widget_html()
 
 
-_MCP_TOOLS = (list_decks, create_card, propose_cards, create_cards)
+_MCP_TOOLS = (
+    list_decks,
+    list_cards,
+    find_similar_cards,
+    create_card,
+    propose_cards,
+    create_cards,
+)
 
 _CARD_WIDGET_META = {
     "ui": {

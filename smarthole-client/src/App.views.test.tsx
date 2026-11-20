@@ -1201,3 +1201,177 @@ test('browse bulk delete removes all selected cards with one confirm', async () 
     vi.unstubAllGlobals();
   }
 });
+
+test('browse column headings sort the list on click', async () => {
+  const row = (id: string, front: string) => ({
+    card_id: id,
+    front_text: front,
+    due: '2026-11-08',
+    last_review: null,
+    created_at: '2026-10-01T00:00:00+00:00',
+    state: 2,
+    reps: 1,
+    suspended: false,
+    due_today: true,
+  });
+  const fetchMock = vi.fn(async (url: any) => {
+    const u = String(url);
+    const body = (v: any) => ({ ok: true, json: () => Promise.resolve(v) });
+    if (u === '/api/config') return body({ googleClientId: null });
+    if (u === '/api/me') return body({ email: 't@example.com' });
+    if (u === '/api/decks')
+      return body({
+        decks: [{ id: 'd1', name: 'Test', total: 10, due: 3, due_today: 5, new: 2 }],
+      });
+    if (u.startsWith('/api/next')) return body({ cards: [] });
+    if (u.startsWith('/api/decks/d1/cards'))
+      return body({ cards: [row('c1', 'Q one')], total: 1 });
+    throw new Error(`unexpected fetch ${u}`);
+  });
+  vi.stubGlobal('fetch', fetchMock);
+  render(<App />);
+  await waitFor(() => expect(screen.getByLabelText('menu')).toBeTruthy());
+  fireEvent.click(screen.getByLabelText('menu'));
+  fireEvent.click(screen.getAllByText('Browse')[0]);
+  await waitFor(() => expect(screen.getByText('Q one')).toBeTruthy());
+  fireEvent.click(screen.getByText('Created'));
+  await waitFor(() =>
+    expect(
+      fetchMock.mock.calls.some(([u]) => String(u).includes('sort=created_at')),
+    ).toBe(true),
+  );
+  vi.unstubAllGlobals();
+});
+
+test('stats view shows server deploy and UI build times', async () => {
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (url: any) => {
+      const u = String(url);
+      const body = (v: any) => ({ ok: true, json: () => Promise.resolve(v) });
+      if (u === '/api/config') return body({ googleClientId: null });
+      if (u === '/api/me') return body({ email: 't@example.com' });
+      if (u === '/api/decks')
+        return body({
+          decks: [{ id: 'd1', name: 'Test', total: 10, due: 3, due_today: 5, new: 2 }],
+        });
+      if (u.startsWith('/api/next')) return body({ cards: [] });
+      if (u === '/api/stats')
+        return body({
+          totals: { cards: 10, new: 3, learning: 1, review: 5, suspended: 1, due: 2 },
+          today: { studied: 4, new: 1, reviews: 5, accuracy: 80.0 },
+          forecast: [{ date: '2026-11-08', due: 2 }],
+        });
+      if (u === '/api/build-info')
+        return body({ server_started_at: '2026-11-12T14:05:00+00:00', server_git_sha: 'abc123' });
+      throw new Error(`unexpected fetch ${u}`);
+    }),
+  );
+  render(<App />);
+  await waitFor(() => expect(screen.getByLabelText('menu')).toBeTruthy());
+  fireEvent.click(screen.getByLabelText('menu'));
+  fireEvent.click(screen.getByText('Stats'));
+  await waitFor(() => expect(screen.getByTestId('due-forecast-chart')).toBeTruthy());
+  expect(screen.getByTestId('build-info')).toHaveTextContent('Server deployed');
+  expect(screen.getByTestId('build-info')).toHaveTextContent('UI built');
+  vi.unstubAllGlobals();
+});
+
+test('feedback view submits typed feedback and lists it', async () => {
+  const mine: any[] = [];
+  const fetchMock = vi.fn(async (url: any, init?: any) => {
+    const u = String(url);
+    const body = (v: any) => ({ ok: true, json: () => Promise.resolve(v) });
+    if (u === '/api/config') return body({ googleClientId: null });
+    if (u === '/api/me') return body({ email: 't@example.com' });
+    if (u === '/api/decks')
+      return body({
+        decks: [{ id: 'd1', name: 'Test', total: 10, due: 3, due_today: 5, new: 2 }],
+      });
+    if (u.startsWith('/api/next')) return body({ cards: [] });
+    if (u === '/api/feedback' && (!init?.method || init.method === 'GET'))
+      return body({ feedback: [...mine] });
+    if (u === '/api/feedback' && init?.method === 'POST') {
+      const created = {
+        id: 'f1',
+        email: 't@example.com',
+        username: '',
+        text: JSON.parse(init.body).text,
+        screen: 'Feedback',
+        status: 'submitted',
+        created_at: '2026-11-12T14:05:00+00:00',
+      };
+      mine.unshift(created);
+      return { ok: true, status: 201, json: () => Promise.resolve(created) };
+    }
+    if (u.startsWith('/api/feedback/all'))
+      return {
+        ok: false,
+        status: 403,
+        text: () => Promise.resolve('Admin only'),
+        json: () => Promise.resolve({}),
+      };
+    throw new Error(`unexpected fetch ${u} ${init?.method ?? 'GET'}`);
+  });
+  vi.stubGlobal('fetch', fetchMock);
+  render(<App />);
+  await waitFor(() => expect(screen.getByLabelText('menu')).toBeTruthy());
+  fireEvent.click(screen.getByRole('button', { name: 'Feedback' }));
+  await waitFor(() => expect(screen.getByLabelText('Your feedback')).toBeTruthy());
+  expect(screen.getByText('My feedback')).toBeTruthy();
+  fireEvent.change(screen.getByLabelText('Your feedback'), {
+    target: { value: 'Great app' },
+  });
+  fireEvent.click(screen.getByRole('button', { name: 'Submit' }));
+  await waitFor(() => expect(screen.getByText('Great app')).toBeTruthy());
+  expect(
+    fetchMock.mock.calls.some(
+      ([u, init]) => u === '/api/feedback' && init?.method === 'POST',
+    ),
+  ).toBe(true);
+  vi.unstubAllGlobals();
+});
+
+test('feedback view shows everyone with usernames for the admin', async () => {
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (url: any) => {
+      const u = String(url);
+      const body = (v: any) => ({ ok: true, json: () => Promise.resolve(v) });
+      if (u === '/api/config') return body({ googleClientId: null });
+      if (u === '/api/me') return body({ email: 'anthonynolan@gmail.com' });
+      if (u === '/api/decks')
+        return body({
+          decks: [{ id: 'd1', name: 'Test', total: 10, due: 3, due_today: 5, new: 2 }],
+        });
+      if (u.startsWith('/api/next')) return body({ cards: [] });
+      if (u === '/api/feedback') return body({ feedback: [] });
+      if (u.startsWith('/api/feedback/all'))
+        return body({
+          feedback: [
+            {
+              id: 'f9',
+              email: 'someone@example.com',
+              username: 'Someone',
+              text: 'Needs work',
+              screen: 'Review',
+              status: 'submitted',
+              created_at: '2026-11-12T14:05:00+00:00',
+            },
+          ],
+        });
+      throw new Error(`unexpected fetch ${u}`);
+    }),
+  );
+  render(<App />);
+  await waitFor(() => expect(screen.getByLabelText('menu')).toBeTruthy());
+  fireEvent.click(screen.getByRole('button', { name: 'Feedback' }));
+  await waitFor(() => expect(screen.getByText('All feedback')).toBeTruthy());
+  expect(screen.getByText('Someone')).toBeTruthy();
+  expect(screen.getByText('Needs work')).toBeTruthy();
+  // One status filter plus one per-item status control.
+  expect(screen.getAllByLabelText('Status')).toHaveLength(2);
+  expect(screen.getByLabelText('Filter by user')).toBeTruthy();
+  expect(screen.getByRole('button', { name: 'Export filtered list' })).toBeTruthy();
+  vi.unstubAllGlobals();
+});

@@ -102,7 +102,146 @@ def test_mcp_endpoint_requires_bearer(client):
 
 def test_mcp_tools_registered():
     names = {t.name for t in mcp_server.mcp._tool_manager.list_tools()}
-    assert {"list_decks", "create_card", "propose_cards", "create_cards"} <= names
+    assert {
+        "list_decks",
+        "list_cards",
+        "find_similar_cards",
+        "create_card",
+        "propose_cards",
+        "create_cards",
+    } <= names
+
+
+def test_mcp_instructions_require_propose_for_drafts():
+    assert "list_cards" in mcp_server.MCP_INSTRUCTIONS
+    assert "draft" in mcp_server.MCP_INSTRUCTIONS
+
+
+def test_mcp_list_cards_roundtrip(client):
+    """Viewing existing cards: unfiltered plus substring query."""
+    user = User.objects(email=USER_EMAIL).first()
+    deck = Deck(owner=user, name="View Deck").save()
+    token = _bearer()
+    session = _init_session(client, token)
+
+    created_body, _ = _mcp_rpc(
+        client,
+        {
+            "jsonrpc": "2.0",
+            "id": 20,
+            "method": "tools/call",
+            "params": {
+                "name": "create_card",
+                "arguments": {
+                    "deck_id": str(deck.id),
+                    "front": "photosynthesis",
+                    "back": "plant process",
+                },
+            },
+        },
+        token,
+        session,
+    )
+    card_id = created_body["result"]["structuredContent"]["card_id"]
+
+    listed, _ = _mcp_rpc(
+        client,
+        {
+            "jsonrpc": "2.0",
+            "id": 21,
+            "method": "tools/call",
+            "params": {"name": "list_cards", "arguments": {"deck_id": str(deck.id)}},
+        },
+        token,
+        session,
+    )
+    cards = listed["result"]["structuredContent"]["result"]
+    assert any(
+        c["card_id"] == card_id and "photosynthesis" in c["front_text"] for c in cards
+    )
+
+    filtered, _ = _mcp_rpc(
+        client,
+        {
+            "jsonrpc": "2.0",
+            "id": 22,
+            "method": "tools/call",
+            "params": {
+                "name": "list_cards",
+                "arguments": {"deck_id": str(deck.id), "query": "no-such-text"},
+            },
+        },
+        token,
+        session,
+    )
+    assert filtered["result"]["structuredContent"]["result"] == []
+
+
+def test_mcp_find_similar_validates_input(client):
+    user = User.objects(email=USER_EMAIL).first()
+    Deck(owner=user, name="Sim Deck").save()
+    token = _bearer()
+    session = _init_session(client, token)
+
+    empty, _ = _mcp_rpc(
+        client,
+        {
+            "jsonrpc": "2.0",
+            "id": 23,
+            "method": "tools/call",
+            "params": {"name": "find_similar_cards", "arguments": {}},
+        },
+        token,
+        session,
+    )
+    assert "Provide text or card_id" in str(empty)
+
+    missing, _ = _mcp_rpc(
+        client,
+        {
+            "jsonrpc": "2.0",
+            "id": 24,
+            "method": "tools/call",
+            "params": {
+                "name": "find_similar_cards",
+                "arguments": {"card_id": "000000000000000000000000"},
+            },
+        },
+        token,
+        session,
+    )
+    assert "Card not found" in str(missing)
+
+
+def test_mcp_find_similar_degrades_without_embeddings(client, monkeypatch):
+    """No API key / index: honest unavailable error, never a fake list."""
+    import smarthole.mcp_server as server
+
+    monkeypatch.setattr(
+        server.embeddings,
+        "embed_text",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("no key")),
+    )
+    user = User.objects(email=USER_EMAIL).first()
+    deck = Deck(owner=user, name="Sim Deck 2").save()
+    token = _bearer()
+    session = _init_session(client, token)
+
+    body, _ = _mcp_rpc(
+        client,
+        {
+            "jsonrpc": "2.0",
+            "id": 25,
+            "method": "tools/call",
+            "params": {
+                "name": "find_similar_cards",
+                "arguments": {"deck_id": str(deck.id), "text": "plants"},
+            },
+        },
+        token,
+        session,
+    )
+    assert "unavailable" in str(body)
 
 
 def test_mcp_propose_then_create_roundtrip(client):
