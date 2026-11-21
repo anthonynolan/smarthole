@@ -196,6 +196,63 @@ def review_card_with_ai(
     return parse_suggestions(extract_response_text(response)), AI_MODEL
 
 
+CHAT_SYSTEM_INSTRUCTIONS = """You are a friendly tutor helping the user study their flashcards.
+
+Rules:
+- Explain using the cards below as context, in your own words; you may also
+  use general knowledge to fill gaps, with the cards taking precedence.
+- Be concise: a few sentences, or a short list for multi-fact answers.
+- Plain text only, no HTML."""
+
+CHAT_HISTORY_LIMIT = 10
+
+
+def build_chat_prompt(
+    question: str, cards: list[dict], history: list[dict] | None = None
+) -> str:
+    """Prompt for deck chat: retrieved cards as context plus recent history."""
+    parts = []
+    for i, card in enumerate(cards, 1):
+        deck = (card.get("deck_name") or "").strip()
+        label = f"Card {i} ({deck})" if deck else f"Card {i}"
+        parts.append(
+            f"{label}:\nQ: {(card.get('front') or '').strip()}\n"
+            f"A: {(card.get('back') or '').strip()}"
+        )
+    context = "\n\n".join(parts) if parts else "(no cards retrieved)"
+    convo = ""
+    for msg in (history or [])[-CHAT_HISTORY_LIMIT:]:
+        role = "User" if msg.get("role") == "user" else "Assistant"
+        text = (msg.get("text") or "").strip()
+        if text:
+            convo += f"\n{role}: {text}"
+    return (
+        "Study cards:\n\n"
+        f"{context}\n"
+        f"{convo}\n"
+        f"User: {(question or '').strip()}\n\n"
+        "Reply in plain text only."
+    )
+
+
+def answer_chat_with_ai(
+    question: str,
+    cards: list[dict],
+    history: list[dict] | None = None,
+    client=None,
+) -> tuple[str, str]:
+    """Answer a study question with retrieved cards as context."""
+    if not (question or "").strip():
+        raise ValueError("A question is required")
+    client = _require_client(client)
+    response = client.responses.create(
+        model=AI_MODEL,
+        instructions=CHAT_SYSTEM_INSTRUCTIONS,
+        input=build_chat_prompt(question, cards, history),
+    )
+    return extract_response_text(response).strip(), AI_MODEL
+
+
 def answer_question_with_ai(
     front_html: str, back_html: str, question: str, client=None
 ) -> tuple[str, str]:

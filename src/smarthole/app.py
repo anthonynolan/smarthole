@@ -51,7 +51,7 @@ from .auth import (
     verify_google_token,
     verify_password,
 )
-from .models import Card, CardState, Deck, Feedback, Media, Review, User
+from .models import Card, CardState, Deck, Feedback, Media, Review, Session, User
 from .models import ensure_card_number as _ensure_card_number
 from .models import next_card_number as _next_card_number
 
@@ -110,6 +110,20 @@ class AiReviewBody(BaseModel):
     question: str | None = None
 
 
+class ChatHistoryMessage(BaseModel):
+    role: Literal["user", "assistant"] = "user"
+    text: str
+
+
+class ChatBody(BaseModel):
+    message: str
+    deck_ids: list[str] | None = None
+    history: list[ChatHistoryMessage] | None = None
+
+
+CHAT_CONTEXT_CARDS = 8
+
+
 class FeedbackBody(BaseModel):
     text: str
     screen: str | None = None
@@ -117,6 +131,10 @@ class FeedbackBody(BaseModel):
 
 class FeedbackStatusBody(BaseModel):
     status: str
+
+
+class OverwriteDevBody(BaseModel):
+    confirm: str | None = None
 
 
 FEEDBACK_STATUSES = ("submitted", "in_progress", "resolved")
@@ -319,7 +337,10 @@ def create_app() -> FastAPI:
 
     @app.get("/api/me")
     def me(user: User = Depends(get_current_user)):
-        return {"email": user.email}
+        return {
+            "email": user.email,
+            "is_admin": (user.email or "").lower() in _admin_emails(),
+        }
 
     @app.get("/api/config")
     def config():
@@ -746,6 +767,106 @@ def create_app() -> FastAPI:
         return StreamingResponse(
             stream_lines(), media_type="application/x-ndjson"
         )
+
+    @app.post("/api/chat")
+    def deck_chat(body: ChatBody, user: User = Depends(get_current_user)):
+        """Answer a study question using the caller's cards as context.
+
+        Embeds the message, retrieves the most similar cards (all decks, or
+        just ``deck_ids``), and answers tutor-style with those cards named.
+        """
+        from .apkg_import import html_to_text
+
+        message = (body.message or "").strip()
+        if not message:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST, "A message is required"
+            )
+        if body.deck_ids:
+            decks = []
+            for did in body.deck_ids:
+                try:
+                    deck = Deck.objects(owner=user, id=did).first()
+                except Exception:
+                    deck = None
+                if deck is None:
+                    raise HTTPException(
+                        status.HTTP_404_NOT_FOUND, "Deck not found"
+                    )
+                decks.append(deck)
+            deck_ids = [d.id for d in decks]
+        else:
+            deck_ids = [d.id for d in Deck.objects(owner=user)]
+        try:
+            query_vector, _ = embeddings.embed_text(
+                embeddings.card_embedding_text(message, "")
+            )
+        except RuntimeError as exc:
+            raise HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)
+            ) from exc
+        except Exception as exc:
+            raise HTTPException(
+                status.HTTP_502_BAD_GATEWAY, f"Chat failed: {exc}"
+            ) from exc
+        try:
+            rows = embeddings.similar_cards(
+                Card._get_collection(),
+                query_vector,
+                deck_ids=deck_ids or None,
+                limit=CHAT_CONTEXT_CARDS,
+                min_score=_related_min_score(),
+            )
+        except Exception as exc:
+            logger.warning("deck chat retrieval unavailable: %s", exc)
+            raise HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                "Similarity search is unavailable "
+                "(embeddings or the vector index are not configured)",
+            ) from exc
+        context = []
+        cited = []
+        if rows:
+            by_id = {
+                c.id: c
+                for c in Card.objects(id__in=[r["_id"] for r in rows])
+                if not c.deleted and not c.suspended
+            }
+            deck_names = {d.id: d.name for d in Deck.objects(id__in=list(deck_ids))} if deck_ids else {}
+            for r in rows:
+                card = by_id.get(r["_id"])
+                if card is None:
+                    continue
+                front = html_to_text(card.front_html or "")
+                back = html_to_text(card.back_html or "")
+                deck_name = deck_names.get(card.deck.id, "")
+                context.append(
+                    {"front": front, "back": back, "deck_name": deck_name}
+                )
+                cited.append(
+                    {
+                        "card_id": str(card.id),
+                        "front_text": plain_text(card.front_html),
+                        "deck_name": deck_name,
+                        "score": round(float(r.get("score") or 0), 4),
+                    }
+                )
+        history = (
+            [{"role": m.role, "text": m.text} for m in (body.history or [])]
+            if body.history
+            else None
+        )
+        try:
+            answer, model = ai_review.answer_chat_with_ai(message, context, history)
+        except RuntimeError as exc:
+            raise HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)
+            ) from exc
+        except Exception as exc:
+            raise HTTPException(
+                status.HTTP_502_BAD_GATEWAY, f"Chat failed: {exc}"
+            ) from exc
+        return {"answer": answer, "model": model, "cards": cited}
 
     @app.delete("/api/cards/{card_id}")
     def delete_card(
@@ -1335,6 +1456,60 @@ def create_app() -> FastAPI:
             headers={"content-disposition": 'attachment; filename="feedback.csv"'},
         )
 
+    @app.post("/api/admin/overwrite-dev-from-prod")
+    def overwrite_dev_from_prod(
+        body: OverwriteDevBody, user: User = Depends(get_current_user)
+    ):
+        """Replace ALL data in this database with the production database.
+
+        Admin only, and only when this server runs on a non-production
+        database (refuses on prod itself). Requires
+        ``{"confirm": "overwrite-dev"}`` so a stray click cannot wipe dev.
+        User sessions are copied too, so the caller must log in again
+        afterwards with a production account.
+        """
+        from mongoengine.connection import get_db
+
+        from . import mongo_connection
+
+        _require_admin(user)
+        if (body.confirm or "") != "overwrite-dev":
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                'Set {"confirm": "overwrite-dev"} to confirm the overwrite',
+            )
+        prod_name = (os.getenv("PROD_MONGO_DB_NAME") or mongo_connection.PROD_DB).strip()
+        current = get_db()
+        if current.name == prod_name:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                "Refusing: this server runs on the production database",
+            )
+        try:
+            prod = current.client[prod_name]
+            names = sorted(prod.list_collection_names())
+            if not names:
+                raise RuntimeError("production database has no collections")
+            counts = _copy_database(prod, current, names)
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(
+                status.HTTP_502_BAD_GATEWAY, f"Overwrite failed: {exc}"
+            ) from exc
+        for doc in (User, Session, Deck, Card, CardState, Feedback, Review, Media):
+            try:
+                doc.ensure_indexes()
+            except Exception:
+                pass
+        return {
+            "overwritten": True,
+            "from": prod_name,
+            "to": current.name,
+            "collections": counts,
+            "relogin_required": True,
+        }
+
     @app.get("/media/{sha}")
     def serve_media(sha: str):
         item = Media.objects(sha256=sha).first()
@@ -1442,6 +1617,25 @@ def _store_media(media: dict[str, bytes]) -> dict[str, str]:
 
 def _day_start() -> datetime:
     return utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+def _copy_database(source, target, names: list[str]) -> dict[str, int]:
+    """Replace target's collections with source's documents.
+
+    ``names`` must already be listed (so an unreachable/empty source fails
+    before anything is dropped). System collections are never copied.
+    Returns per-collection document counts.
+    """
+    counts = {}
+    for name in names:
+        if name.startswith("system."):
+            continue
+        docs = list(source[name].find({}))
+        target[name].drop()
+        if docs:
+            target[name].insert_many(docs)
+        counts[name] = len(docs)
+    return counts
 
 
 def _git_sha() -> str | None:

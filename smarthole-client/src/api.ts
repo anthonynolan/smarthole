@@ -34,6 +34,7 @@ export async function loadConfig(): Promise<AppConfig> {
 
 export interface Me {
   email: string;
+  is_admin?: boolean;
 }
 
 export async function getMe(): Promise<Me | null> {
@@ -45,7 +46,28 @@ export async function getMe(): Promise<Me | null> {
   }
   const data = await res.json();
   if (!data || typeof data.email !== 'string') return null;
-  return { email: data.email };
+  return { email: data.email, is_admin: data.is_admin === true };
+}
+
+/**
+ * Replace ALL dev data with the production database (admin only, and only
+ * when the server runs on a non-production database). Sessions are copied
+ * too, so the caller must log in again afterwards.
+ */
+export interface OverwriteDevResult {
+  overwritten: boolean;
+  from: string;
+  to: string;
+  collections: Record<string, number>;
+  relogin_required: boolean;
+}
+
+export async function overwriteDevFromProd(): Promise<OverwriteDevResult> {
+  const res = await apiFetch('/admin/overwrite-dev-from-prod', {
+    method: 'POST',
+    body: JSON.stringify({ confirm: 'overwrite-dev' }),
+  });
+  return readJson(res);
 }
 
 export async function login(email: string, password: string): Promise<Me> {
@@ -420,6 +442,46 @@ export async function setCardDue(
   const res = await apiFetch(`/cards/${encodeURIComponent(cardId)}/due`, {
     method: 'PUT',
     body: JSON.stringify({ due }),
+  });
+  return readJson(res);
+}
+
+export type ChatRole = 'user' | 'assistant';
+
+export interface ChatHistoryMessage {
+  role: ChatRole;
+  text: string;
+}
+
+export interface ChatCitedCard {
+  card_id: string;
+  front_text: string;
+  deck_name: string;
+  score: number;
+}
+
+export interface ChatReply {
+  answer: string;
+  model: string;
+  cards: ChatCitedCard[];
+}
+
+/**
+ * Ask a study question across the caller's cards (all decks, or just
+ * `deckIds`). Answers tutor-style with the retrieved cards named.
+ */
+export async function chatDeck(
+  message: string,
+  deckIds?: string[],
+  history?: ChatHistoryMessage[],
+): Promise<ChatReply> {
+  const res = await apiFetch('/chat', {
+    method: 'POST',
+    body: JSON.stringify({
+      message,
+      ...(deckIds && deckIds.length > 0 ? { deck_ids: deckIds } : {}),
+      ...(history && history.length > 0 ? { history } : {}),
+    }),
   });
   return readJson(res);
 }

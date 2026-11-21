@@ -50,6 +50,7 @@ import { GoogleLogin, GoogleOAuthProvider } from '@react-oauth/google';
 import {
   BROWSE_PAGE,
   browseCards,
+  chatDeck,
   createCard,
   deleteCard,
   fmtDate,
@@ -68,6 +69,7 @@ import {
   loadConfig,
   login,
   logout,
+  overwriteDevFromProd,
   register,
   requestAiReviewStream,
   restoreCard,
@@ -92,15 +94,18 @@ import {
   type BrowseSort,
   type BuildInfo,
   type CardMeta,
+  type ChatCitedCard,
+  type ChatHistoryMessage,
   type Deck,
   type FeedbackItem,
   type FeedbackStatus,
+  type OverwriteDevResult,
   type RelatedCard,
   type ReviewCard,
   type Stats,
 } from './api';
 
-type View = 'review' | 'browse' | 'add' | 'import' | 'stats' | 'feedback';
+type View = 'review' | 'browse' | 'add' | 'import' | 'stats' | 'chat' | 'feedback' | 'admin';
 
 const theme = createTheme({
   typography: {
@@ -134,6 +139,7 @@ const qaTextSx = {
 
 export default function App() {
   const [me, setMe] = useState<string | null>(null);
+  const [isAdmin, setIsAdmin] = useState(false);
   const [authChecked, setAuthChecked] = useState(false);
   const [clientId, setClientId] = useState<string>('');
   const [configError, setConfigError] = useState<string | null>(null);
@@ -148,6 +154,7 @@ export default function App() {
         const m = await getMe().catch(() => null);
         if (!cancelled && m) {
           setMe(m.email);
+          setIsAdmin(m.is_admin === true);
           setView('review');
         }
       } finally {
@@ -170,11 +177,17 @@ export default function App() {
     setAuthError(null);
     setView('review');
     setDrawerOpen(false);
+    getMe()
+      .then((m) => {
+        if (m) setIsAdmin(m.is_admin === true);
+      })
+      .catch(() => undefined);
   }, []);
 
   const handleLogout = useCallback(async () => {
     await logout().catch(() => undefined);
     setMe(null);
+    setIsAdmin(false);
     setView('review');
     setDrawerOpen(false);
   }, []);
@@ -319,6 +332,15 @@ export default function App() {
             <ListItemText primary="Stats" />
           </ListItemButton>
           <ListItemButton
+            selected={view === 'chat'}
+            onClick={() => {
+              setView('chat');
+              setDrawerOpen(false);
+            }}
+          >
+            <ListItemText primary="Chat" />
+          </ListItemButton>
+          <ListItemButton
             selected={view === 'feedback'}
             onClick={() => {
               setView('feedback');
@@ -327,6 +349,17 @@ export default function App() {
           >
             <ListItemText primary="Feedback" />
           </ListItemButton>
+          {isAdmin && (
+            <ListItemButton
+              selected={view === 'admin'}
+              onClick={() => {
+                setView('admin');
+                setDrawerOpen(false);
+              }}
+            >
+              <ListItemText primary="Admin" />
+            </ListItemButton>
+          )}
           <ListItemButton onClick={handleLogout}>
             <ListItemText primary="Logout" />
           </ListItemButton>
@@ -338,7 +371,9 @@ export default function App() {
         {view === 'add' && <AddView />}
         {view === 'import' && <ImportView />}
         {view === 'stats' && <StatsView />}
+        {view === 'chat' && <ChatView />}
         {view === 'feedback' && <FeedbackView />}
+        {view === 'admin' && <AdminView />}
       </Container>
     </Box>
   );
@@ -2760,6 +2795,200 @@ function FeedbackView() {
           <Typography sx={{ mt: 1, whiteSpace: 'pre-wrap' }}>{f.text}</Typography>
         </Paper>
       ))}
+    </Box>
+  );
+}
+
+function AdminView() {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [result, setResult] = useState<OverwriteDevResult | null>(null);
+
+  const run = async () => {
+    if (
+      !window.confirm(
+        'Replace ALL dev data with the production database? This cannot be undone.',
+      )
+    ) {
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    try {
+      setResult(await overwriteDevFromProd());
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const totalDocs = result
+    ? Object.values(result.collections).reduce((a, b) => a + b, 0)
+    : 0;
+
+  return (
+    <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+      <Typography variant="h6">Admin</Typography>
+      <Typography color="text.secondary">
+        Overwrite this dev database ({'smarthole_dev'}) with a copy of the
+        production database. Sessions are copied too, so you will need to log
+        in again afterwards with a production account. The server refuses to
+        run this on production itself.
+      </Typography>
+      <Box>
+        <Button
+          variant="contained"
+          color="error"
+          onClick={run}
+          disabled={busy}
+        >
+          {busy ? 'Overwriting…' : 'Overwrite dev data with production data'}
+        </Button>
+      </Box>
+      {error && <Alert severity="error">{error}</Alert>}
+      {result && (
+        <Alert severity="success">
+          Dev data replaced with production data ({totalDocs} documents in{' '}
+          {Object.keys(result.collections).length} collections). Please log out
+          and log in again.
+        </Alert>
+      )}
+    </Box>
+  );
+}
+
+interface ChatBubble {
+  role: 'user' | 'assistant';
+  text: string;
+  cards?: ChatCitedCard[];
+}
+
+function ChatView() {
+  const { decks } = useDecks();
+  // null = all decks; otherwise only these deck ids.
+  const [picked, setPicked] = useState<string[] | null>(null);
+  const [messages, setMessages] = useState<ChatBubble[]>([]);
+  const [input, setInput] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const bottomRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    // scrollIntoView is a browser API (absent in test DOMs).
+    bottomRef.current?.scrollIntoView?.({ block: 'nearest' });
+  }, [messages.length, busy]);
+
+  const toggleDeck = (id: string) =>
+    setPicked((prev) => {
+      const cur = prev ?? decks.map((d) => d.id);
+      return cur.includes(id) ? cur.filter((d) => d !== id) : [...cur, id];
+    });
+
+  const activeIds = picked ?? decks.map((d) => d.id);
+
+  const send = async () => {
+    const text = input.trim();
+    if (!text || busy) return;
+    const history: ChatHistoryMessage[] = messages.map((m) => ({
+      role: m.role,
+      text: m.text,
+    }));
+    setMessages((prev) => [...prev, { role: 'user', text }]);
+    setInput('');
+    setBusy(true);
+    setError(null);
+    try {
+      const reply = await chatDeck(text, activeIds, history);
+      setMessages((prev) => [
+        ...prev,
+        { role: 'assistant', text: reply.answer, cards: reply.cards },
+      ]);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1.5 }}>
+      <Typography variant="h6">Deck chat</Typography>
+      <Box sx={{ display: 'flex', gap: 1, flexWrap: 'wrap' }}>
+        <Button
+          size="small"
+          variant={picked === null ? 'contained' : 'outlined'}
+          onClick={() => setPicked(null)}
+        >
+          All decks
+        </Button>
+        {decks.map((d) => (
+          <Button
+            key={d.id}
+            size="small"
+            variant={activeIds.includes(d.id) && picked !== null ? 'contained' : 'outlined'}
+            onClick={() => toggleDeck(d.id)}
+          >
+            {d.name}
+          </Button>
+        ))}
+      </Box>
+      {messages.length === 0 && (
+        <Typography color="text.secondary">
+          Ask anything about your cards — answers use your decks as context and
+          name the cards they came from.
+        </Typography>
+      )}
+      {messages.map((m, i) => (
+        <Paper
+          key={i}
+          sx={{
+            p: 1.5,
+            alignSelf: m.role === 'user' ? 'flex-end' : 'flex-start',
+            maxWidth: '90%',
+            bgcolor: m.role === 'user' ? 'action.selected' : undefined,
+          }}
+        >
+          <Typography sx={{ whiteSpace: 'pre-wrap' }}>{m.text}</Typography>
+          {m.cards && m.cards.length > 0 && (
+            <Box sx={{ mt: 1 }}>
+              {m.cards.map((c) => (
+                <Typography key={c.card_id} variant="caption" color="text.secondary" sx={{ display: 'block' }}>
+                  {c.deck_name ? `${c.deck_name}: ` : ''}{c.front_text}
+                </Typography>
+              ))}
+            </Box>
+          )}
+        </Paper>
+      ))}
+      {busy && (
+        <Box sx={{ py: 1 }}>
+          <CircularProgress size={20} aria-label="waiting for answer" />
+        </Box>
+      )}
+      {error && <Alert severity="error">{error}</Alert>}
+      <Box sx={{ display: 'flex', gap: 1 }}>
+        <TextField
+          label="Ask about your cards"
+          fullWidth
+          size="small"
+          multiline
+          maxRows={4}
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+          disabled={busy}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter' && !e.shiftKey) {
+              e.preventDefault();
+              void send();
+            }
+          }}
+        />
+        <Button variant="contained" onClick={send} disabled={busy || !input.trim()}>
+          Send
+        </Button>
+      </Box>
+      <div ref={bottomRef} aria-hidden style={{ height: 1 }} />
     </Box>
   );
 }

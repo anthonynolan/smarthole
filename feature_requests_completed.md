@@ -80,3 +80,17 @@ Notes: GET /api/build-info reports process start (the honest proxy for last depl
 On the stats screen restrict the graphs to screen width, no horizontal scroll. Make the bars tighter and turn the labels sideways to achieve this if necessary.
 Status: Done.
 Notes: Both bar charts are now flex fit-to-width (overflow hidden, 2px gaps, narrower bars) with sideways (vertical) date labels. Test: stats view renders due-forecast chart testid.
+
+I want to be able to overwrite the dev data with the production data. This should only be possible for the admin user.
+Completed: 21-Nov-26 10:26 UTC.
+Status: Done.
+Notes: New POST /api/admin/overwrite-dev-from-prod with {"confirm": "overwrite-dev"} copies every collection from smarthole_prod into the current database via the same cluster client. Triple-guarded: (1) admin only via _require_admin (403 otherwise), (2) refuses when the server itself runs on the production database, (3) explicit confirm string plus a refusal when prod has no collections (so a typo cannot wipe dev first). Sessions are copied too, so the admin must log in again with a production account. UI: /api/me now reports is_admin; admins get an "Admin" drawer section with a double-confirmed overwrite button and relogin notice. Tests: 5 backend (forbidden/confirm/copy/refusals) + 2 frontend (admin flow, non-admin hidden).
+
+
+Give me a list of features in Anki that I might add here. In addition suggest some new features which I might add. 
+
+
+Deck chat: let me ask questions across my cards and get answers grounded in what I am studying, using the existing card embeddings.
+Completed: 21-Nov-26 10:49 UTC.
+Status: Done.
+Notes: New "Chat" drawer page + POST /api/chat. Searches all decks by default with a per-deck filter; embeds the question, retrieves the top 8 similar cards (RELATED_MIN_SCORE threshold), and answers tutor-style via Muse Spark with the cards named under each answer. Follow-up questions work via the last 10 messages of history. Honors the clarified choices: all decks + filter, tutor-style with cards as context, new drawer page. Degrades honestly: 503 when embeddings are unavailable, 400 on empty questions, 404 on foreign decks. Tests: 5 backend (answer + citations, deck scoping, validation, 503 path, prompt history cap) + 1 frontend (send/receive/cited cards).

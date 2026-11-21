@@ -1375,3 +1375,127 @@ test('feedback view shows everyone with usernames for the admin', async () => {
   expect(screen.getByRole('button', { name: 'Export filtered list' })).toBeTruthy();
   vi.unstubAllGlobals();
 });
+
+test('admin view overwrites dev data after confirmation', async () => {
+  const fetchMock = vi.fn(async (url: any, init?: any) => {
+    const u = String(url);
+    const body = (v: any) => ({ ok: true, json: () => Promise.resolve(v) });
+    if (u === '/api/config') return body({ googleClientId: null });
+    if (u === '/api/me')
+      return body({ email: 'anthonynolan@gmail.com', is_admin: true });
+    if (u === '/api/decks')
+      return body({
+        decks: [{ id: 'd1', name: 'Test', total: 10, due: 3, due_today: 5, new: 2 }],
+      });
+    if (u.startsWith('/api/next')) return body({ cards: [] });
+    if (
+      u === '/api/admin/overwrite-dev-from-prod' &&
+      init?.method === 'POST'
+    )
+      return body({
+        overwritten: true,
+        from: 'smarthole_prod',
+        to: 'smarthole_dev',
+        collections: { decks: 2, cards: 5 },
+        relogin_required: true,
+      });
+    throw new Error(`unexpected fetch ${u} ${init?.method ?? 'GET'}`);
+  });
+  vi.stubGlobal('fetch', fetchMock);
+  const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true);
+  try {
+    render(<App />);
+    await waitFor(() => expect(screen.getByLabelText('menu')).toBeTruthy());
+    fireEvent.click(screen.getByLabelText('menu'));
+    fireEvent.click(screen.getByText('Admin'));
+    await waitFor(() =>
+      expect(
+        screen.getByRole('button', {
+          name: 'Overwrite dev data with production data',
+        }),
+      ).toBeTruthy(),
+    );
+    fireEvent.click(
+      screen.getByRole('button', {
+        name: 'Overwrite dev data with production data',
+      }),
+    );
+    await waitFor(() =>
+      expect(screen.getByText(/Dev data replaced with production data/)).toBeTruthy(),
+    );
+    expect(confirmSpy).toHaveBeenCalledTimes(1);
+    const posted = fetchMock.mock.calls.find(
+      ([u, init]) =>
+        u === '/api/admin/overwrite-dev-from-prod' && init?.method === 'POST',
+    );
+    expect(JSON.parse(posted[1].body)).toEqual({ confirm: 'overwrite-dev' });
+  } finally {
+    confirmSpy.mockRestore();
+    vi.unstubAllGlobals();
+  }
+});
+
+test('non-admin users see no Admin section', async () => {
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (url: any) => {
+      const u = String(url);
+      const body = (v: any) => ({ ok: true, json: () => Promise.resolve(v) });
+      if (u === '/api/config') return body({ googleClientId: null });
+      if (u === '/api/me') return body({ email: 't@example.com' });
+      if (u === '/api/decks')
+        return body({
+          decks: [{ id: 'd1', name: 'Test', total: 10, due: 3, due_today: 5, new: 2 }],
+        });
+      if (u.startsWith('/api/next')) return body({ cards: [] });
+      throw new Error(`unexpected fetch ${u}`);
+    }),
+  );
+  render(<App />);
+  await waitFor(() => expect(screen.getByLabelText('menu')).toBeTruthy());
+  fireEvent.click(screen.getByLabelText('menu'));
+  await waitFor(() => expect(screen.getAllByText('Feedback').length).toBeGreaterThan(0));
+  expect(screen.queryByText('Admin')).toBeNull();
+  vi.unstubAllGlobals();
+});
+
+test('deck chat sends the question and shows the answer with cited cards', async () => {
+  const fetchMock = vi.fn(async (url: any, init?: any) => {
+    const u = String(url);
+    const body = (v: any) => ({ ok: true, json: () => Promise.resolve(v) });
+    if (u === '/api/config') return body({ googleClientId: null });
+    if (u === '/api/me') return body({ email: 't@example.com' });
+    if (u === '/api/decks')
+      return body({
+        decks: [{ id: 'd1', name: 'Bio', total: 1, due: 0, due_today: 0, new: 1 }],
+      });
+    if (u.startsWith('/api/next')) return body({ cards: [] });
+    if (u === '/api/chat' && init?.method === 'POST') {
+      const payload = JSON.parse(init.body);
+      expect(payload.message).toBe('what makes energy?');
+      return body({
+        answer: 'The powerhouse of the cell.',
+        model: 'test-model',
+        cards: [
+          { card_id: 'c1', front_text: 'Mitochondria', deck_name: 'Bio', score: 0.9 },
+        ],
+      });
+    }
+    throw new Error(`unexpected fetch ${u} ${init?.method ?? 'GET'}`);
+  });
+  vi.stubGlobal('fetch', fetchMock);
+  render(<App />);
+  await waitFor(() => expect(screen.getByLabelText('menu')).toBeTruthy());
+  fireEvent.click(screen.getByLabelText('menu'));
+  fireEvent.click(screen.getAllByText('Chat')[0]);
+  await waitFor(() => expect(screen.getByLabelText('Ask about your cards')).toBeTruthy());
+  fireEvent.change(screen.getByLabelText('Ask about your cards'), {
+    target: { value: 'what makes energy?' },
+  });
+  fireEvent.click(screen.getByRole('button', { name: 'Send' }));
+  await waitFor(() =>
+    expect(screen.getByText('The powerhouse of the cell.')).toBeTruthy(),
+  );
+  expect(screen.getByText('Bio: Mitochondria')).toBeTruthy();
+  vi.unstubAllGlobals();
+});
