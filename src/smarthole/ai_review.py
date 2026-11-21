@@ -268,6 +268,36 @@ def answer_question_with_ai(
     return extract_response_text(response).strip(), AI_MODEL
 
 
+GENERATE_SYSTEM_INSTRUCTIONS = """You turn pasted study content into flashcards.
+
+Rules:
+- Each suggested card tests exactly one fact, easy to remember.
+- Keep the number of cards small: only the most important items.
+- Drop trivia, duplicates, and minor details.
+- Front is a short question or cue; back is a short answer (one fact).
+- Plain text only, no HTML.
+- Reply with JSON only: {"cards": [{"front": "...", "back": "..."}]}"""
+
+GENERATE_MAX_CHARS = 8000
+
+
+def propose_cards_from_text(content: str, client=None) -> tuple[list[dict], str]:
+    """Propose single-fact cards from pasted content; return (cards, model)."""
+    if not (content or "").strip():
+        raise ValueError("Content is required")
+    client = _require_client(client)
+    response = client.responses.create(
+        model=AI_MODEL,
+        instructions=GENERATE_SYSTEM_INSTRUCTIONS,
+        input=(
+            "Turn the content below into flashcards.\n\n"
+            f"Content:\n{(content or '').strip()[:GENERATE_MAX_CHARS]}\n\n"
+            'Reply with JSON only: {"cards": [{"front": "...", "back": "..."}]}'
+        ),
+    )
+    return parse_suggestions(extract_response_text(response)), AI_MODEL
+
+
 def stream_review_with_ai(
     front_html: str,
     back_html: str,

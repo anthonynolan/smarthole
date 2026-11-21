@@ -94,3 +94,63 @@ Deck chat: let me ask questions across my cards and get answers grounded in what
 Completed: 21-Nov-26 10:49 UTC.
 Status: Done.
 Notes: New "Chat" drawer page + POST /api/chat. Searches all decks by default with a per-deck filter; embeds the question, retrieves the top 8 similar cards (RELATED_MIN_SCORE threshold), and answers tutor-style via Muse Spark with the cards named under each answer. Follow-up questions work via the last 10 messages of history. Honors the clarified choices: all decks + filter, tutor-style with cards as context, new drawer page. Degrades honestly: 503 when embeddings are unavailable, 400 on empty questions, 404 on foreign decks. Tests: 5 backend (answer + citations, deck scoping, validation, 503 path, prompt history cap) + 1 frontend (send/receive/cited cards).
+
+Review heatmap: a year-view grid showing review activity per day so I can see my study consistency at a glance.
+Completed: 21-Nov-26 15:27 UTC.
+Status: Done.
+Notes: GET /api/stats now includes sparse review_history (per-day review counts over the last 365 days). Stats view shows a GitHub-style year grid (Sunday-start weeks, intensity by quartile, tooltips, Less/More legend) that fits screen width. Tests: backend per-day counts + window clip; frontend heatmap render.
+
+Duplicate warning on add: when adding a card, warn me if a near-duplicate already exists, using the existing similarity search.
+Completed: 21-Nov-26 15:29 UTC.
+Status: Done.
+Notes: New GET /api/decks/{id}/duplicates returns exact substring matches first then embedding-similar cards above the related threshold; the similarity half degrades to exact-only when embeddings are unavailable. The Add view checks live (debounced) and shows a non-blocking warning naming the matches. Tests: 4 backend (exact, empty/degraded, stubbed similar, validation) + 1 frontend (warning appears while typing).
+
+AI generated cards from pasted text: a page where I paste content and the app proposes Anki cards from it, which I verify with checkboxes before they are created.
+Completed: 21-Nov-26 15:32 UTC.
+Status: Done.
+Notes: New "Generate cards" drawer page + POST /api/cards/generate (proposes via Muse Spark, capped at 8000 chars, no writes). Proposals render with checkboxes (all ticked by default); "Add N selected" creates the ticked ones via POST /api/cards. 400 on empty/oversized content, 404 on foreign deck, 503 without MODEL_API_KEY. Tests: 3 backend (propose-without-write, validation/auth, missing key) + 1 frontend (propose, untick one, add only the ticked one).
+
+Streaks + daily goal + reminders by email: track my study streak and daily goal, and email me a reminder when I have not studied.
+Completed: 21-Nov-26 15:37 UTC.
+Status: Done.
+Notes: Streak = consecutive UTC days with a graded review (alive if today unstudied but yesterday studied). New User.daily_goal (default 20) and reminder_enabled; GET/PUT /api/preferences; /api/stats gains streak + goal{target,studied,met}. Stats view shows a Day streak card, a Daily goal card with progress bar, and a Goals & reminders editor (goal number + save, reminder checkbox). Reminders: scripts/send_study_reminders.py (evening cron, --dry-run) emails opted-in users with nothing studied today via SMTP (SMTP_* env, documented in .env.example); subject flags a streak at stake. Tests: 6 backend (streak cases, prefs validation, stats fields, reminder selection, SMTP send, missing host) + 1 frontend (streak/goal display, save goal).
+
+FSRS tuning: optimize the FSRS parameters on my review history instead of using the library defaults, with an option to reschedule existing cards.
+Completed: 21-Nov-26 15:42 UTC.
+Status: Done.
+Notes: New per-user SchedulerConfig + /api/fsrs (status), POST /api/fsrs/optimize (coordinate descent on log-loss of the user's own reviews, needs 50+ predictable reviews, no torch needed), POST /api/fsrs/reset, POST /api/fsrs/reschedule (replays each reviewed card's history through the current scheduler via the library's reschedule_card; keeps reps/lapses). Reviews, previews, and queue all use the user's tuned scheduler. Stats view has a Scheduler section (status, optimize/reschedule/reset with confirms and log-loss reporting). Tests: 4 backend (defaults, history gate, full tune/reschedule/reset roundtrip, per-user isolation) + 1 frontend (optimize flow).
+
+Richer stats: true-retention tables, forecast workload, and a calendar view, so scheduling problems show up early.
+Completed: 21-Nov-26 15:46 UTC.
+Status: Done.
+Notes: /api/stats gains retention (learning <1d / young 1-20d / mature 21d+ buckets with review counts and recall rates from graded history), workload (30-day due + daily new-card budget), feeding three new Stats sections: a True retention table, a 14-day Forecast workload table (due/new/total), and a month Calendar with prev/next navigation (studied days green, due days blue, today outlined). Tests: backend bucket math + workload shape; frontend tables + calendar navigation.
+
+Allow limits etc to be configured as opposed to hard coded: per-deck daily limits, learning steps, and new-card order in settings instead of fixed constants like NEW_CARDS_PER_DAY.
+Completed: 21-Nov-26 15:51 UTC.
+Status: Done.
+Notes: Deck.new_cards_per_day (None = global default, 0 resets) + new_order (position/newest) via PUT /api/decks/{id}; budgets enforced per deck and the new queue serves newest-first when set. Learning/relearning steps (minutes) are per-user scheduler settings via PUT /api/fsrs/settings and flow into grading, previews, tuning, and rescheduling. Forecast workload uses summed per-deck limits. UI: deck settings row in Browse, steps editor in the Stats Scheduler section. Tests: 6 backend (settings roundtrip/validation, per-deck budget independence, newest-first, steps affect scheduling, workload) + 2 frontend (deck save, steps save).
+
+Tags: tag cards, edit tags in bulk, and filter browse by tag.
+Completed: 21-Nov-26 15:58 UTC.
+Status: Done.
+Notes: Card.tags (lowercased/deduped, max 20 x 50 chars) with a (deck, tags) index. PATCH /api/cards/{id}/tags replaces one card's tags; POST /api/cards/bulk-tags adds/removes across selected cards (skips foreign/deleted). Browse ?tag= filters (exact match, skips the similarity supplement), tags ride along on rows and the card payload. UI: Filter-by-tag box, per-card Tags editor in the detail dialog, and Add/Remove tag controls in the bulk bar. Imports come in untagged. Tests: 4 backend (normalize/validation, bulk, filter) + 2 frontend (filter, detail save + bulk apply).
+
+On the review page the Related items should only be shown once the answer to the card has been displayed, not when the question only is there. 
+Completed: 21-Nov-26 16:02 UTC.
+Status: Done.
+Notes: The Related hint now renders only after Show answer (gated on the same showBack state as the grade buttons); the fetch still runs early so it appears instantly. Updated the related-card test to pin both halves: hidden with data loaded pre-answer, visible post-answer, queuing still works.
+
+The review schedules are not working. I reviewed all due cards this morning and there are more due now. The counts are also incorrect. They go to 0 and then more are shown. Even though I had not finished this process yesterday when I refreshed there were no cards to review. 
+Completed: 21-Nov-26 16:08 UTC.
+Status: Done (root causes fixed, not a scheduler math error).
+Notes: Two real defects found. (1) The header counted only due reviews while the queue also serves new cards, so it read "0 due" while new cards kept coming: /api/decks now reports new_due (unseen + within today's per-deck budget) and the header reads "N due today · M new today · K studied". (2) Refreshing during intraday learning waits (or after the budget is spent) showed a dead-end "Nothing due": /api/next now returns next_due_at (earliest future due, tz-aware) and the empty state says when the next card matures, e.g. "Nothing due right now — next card in 9m". Verified FSRS scheduling itself is correct (due <= now UTC, intraday steps by design). Tests: 3 backend (budget-scoped new_due, intraday next_due_at, deck scoping) + 1 frontend (header + next-due message).
+
+The initial load of the first card when I am reviewing is too slow. What can be done to speed it up.
+Completed: 21-Nov-26 16:11 UTC.
+Status: Done.
+Notes: Two measured costs removed. (1) The review queue loaded full Card documents (HTML + 1536-float embedding vectors) for the whole deck just to collect ids: _active_cards is now an ids-only values_list query. (2) Every review-page load ran a full /api/stats computation just for the studied-today count: new GET /api/today answers it with one indexed query, and the header uses that. Also folded the per-deck new-count tallies into the single existing raw states query (no extra round-trips per deck). Tests: backend today-count + ids-based queue behavior (covered by review/count suites), frontend header still shows the studied count via /api/today.
+
+I want to be able to add cards using voice dictation. There should be a button to let me add text to the Question and another button to add to the Answer.
+Completed: 21-Nov-26 16:13 UTC.
+Status: Done.
+Notes: New shared DictationButton (browser-native SpeechRecognition, same approach as the Feedback view) with "Dictate question" and "Dictate answer" buttons in the Add view; transcripts append into each field. The Feedback view was refactored onto the same component. Hides itself where recognition is unavailable. Test: fake-recognition dictation into both fields.

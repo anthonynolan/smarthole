@@ -51,8 +51,10 @@ import {
   BROWSE_PAGE,
   browseCards,
   chatDeck,
+  checkDuplicates,
   createCard,
   deleteCard,
+  generateCards,
   fmtDate,
   fmtDateTime,
   fmtInterval,
@@ -62,6 +64,7 @@ import {
   getNext,
   getRelated,
   getStats,
+  getToday,
   googleLogin,
   gradeCard,
   importPackageStream,
@@ -73,15 +76,25 @@ import {
   register,
   requestAiReviewStream,
   restoreCard,
+  bulkTagCards,
   setCardDue,
+  setCardTags,
   suspendCard,
   unsuspendCard,
+  updateDeckSettings,
+  updateFsrsSettings,
   exportDecks,
   exportFeedback,
   getAllFeedback,
   getBuildInfo,
   getOwnFeedback,
+  getFsrsStatus,
+  getPreferences,
+  optimizeFsrs,
+  rescheduleFsrs,
+  resetFsrs,
   setFeedbackStatus,
+  updatePreferences,
   submitFeedback,
   updateCard,
   htmlToText,
@@ -96,16 +109,19 @@ import {
   type CardMeta,
   type ChatCitedCard,
   type ChatHistoryMessage,
+  type DuplicateCard,
   type Deck,
   type FeedbackItem,
   type FeedbackStatus,
+  type FsrsStatus,
   type OverwriteDevResult,
+  type Preferences,
   type RelatedCard,
   type ReviewCard,
   type Stats,
 } from './api';
 
-type View = 'review' | 'browse' | 'add' | 'import' | 'stats' | 'chat' | 'feedback' | 'admin';
+type View = 'review' | 'browse' | 'add' | 'generate' | 'import' | 'stats' | 'chat' | 'feedback' | 'admin';
 
 const theme = createTheme({
   typography: {
@@ -314,6 +330,15 @@ export default function App() {
             <ListItemText primary="Add new card" />
           </ListItemButton>
           <ListItemButton
+            selected={view === 'generate'}
+            onClick={() => {
+              setView('generate');
+              setDrawerOpen(false);
+            }}
+          >
+            <ListItemText primary="Generate cards" />
+          </ListItemButton>
+          <ListItemButton
             selected={view === 'import'}
             onClick={() => {
               setView('import');
@@ -369,6 +394,7 @@ export default function App() {
         {view === 'review' && <ReviewView />}
         {view === 'browse' && <BrowseView />}
         {view === 'add' && <AddView />}
+        {view === 'generate' && <GenerateView />}
         {view === 'import' && <ImportView />}
         {view === 'stats' && <StatsView />}
         {view === 'chat' && <ChatView />}
@@ -610,13 +636,14 @@ function ReviewView() {
   const [queued, setQueued] = useState<ReviewCard | null>(null);
   const [queueBusy, setQueueBusy] = useState(false);
   const [studiedToday, setStudiedToday] = useState<number | null>(null);
+  const [nextDueAt, setNextDueAt] = useState<string | null>(null);
 
   // Best-effort preload of the card after the current one, so grading
   // swaps instantly instead of waiting on a fetch.
   const prefetchNext = useCallback(async (deck: string, excludeId: string) => {
     try {
-      const cards = await getNext(deck as '', excludeId);
-      setPreloaded(cards[0] ?? null);
+      const next = await getNext(deck as '', excludeId);
+      setPreloaded(next.cards[0] ?? null);
     } catch {
       setPreloaded(null);
     }
@@ -624,8 +651,8 @@ function ReviewView() {
 
   const refreshStudied = useCallback(async () => {
     try {
-      const s = await getStats();
-      setStudiedToday(s.today.studied);
+      const t = await getToday();
+      setStudiedToday(t.studied);
     } catch {
       setStudiedToday(null);
     }
@@ -655,9 +682,10 @@ function ReviewView() {
     setRelated([]);
     setQueued(null);
     try {
-      const cards = await getNext(deck as '');
-      const first = cards[0] ?? null;
+      const next = await getNext(deck as '');
+      const first = next.cards[0] ?? null;
       setCard(first);
+      setNextDueAt(next.next_due_at);
       setShowBack(false);
       if (first) void prefetchNext(deck, first.card_id);
     } catch (e) {
@@ -704,6 +732,7 @@ function ReviewView() {
         setQueued(null);
         setPreloaded(null);
         setCard(upNext);
+        setNextDueAt(null);
         setShowBack(false);
         setStatus(null);
         setRelated([]);
@@ -712,6 +741,7 @@ function ReviewView() {
         const next = preloaded;
         setPreloaded(null);
         setCard(next);
+        setNextDueAt(null);
         setShowBack(false);
         setStatus(null);
         void prefetchNext(deckId, next.card_id);
@@ -826,7 +856,7 @@ function ReviewView() {
     );
     try {
       const next = await getNext(deckId as '', currentId);
-      const upNext = next[0] ?? null;
+      const upNext = next.cards[0] ?? null;
       if (upNext) {
         setCard(upNext);
         setStatus(null);
@@ -914,12 +944,15 @@ function ReviewView() {
   const dueToday = scoped
     ? (scoped.due_today ?? 0)
     : decks.reduce((n, d) => n + (d.due_today ?? 0), 0);
+  const newToday = scoped
+    ? (scoped.new_due ?? 0)
+    : decks.reduce((n, d) => n + (d.new_due ?? 0), 0);
 
   return (
     <Box>
       <DeckSelect decks={decks} value={deckId} onChange={setDeckId} allowAll label="Deck" />
       <Typography color="text.secondary" sx={{ mt: 1 }}>
-        {dueToday} due today
+        {dueToday} due today · {newToday} new today
         {studiedToday !== null && ` · ${studiedToday} studied today`}
       </Typography>
       {decksError && <Alert severity="error">Could not load decks: {decksError}</Alert>}
@@ -930,7 +963,11 @@ function ReviewView() {
       )}
       {loading && <CircularProgress aria-label="loading next card" />}
       {!loading && !card && (
-        <Typography color="text.secondary">Nothing due — nice work.</Typography>
+        <Typography color="text.secondary">
+          {nextDueAt
+            ? `Nothing due right now — next card in ${fmtInterval(nextDueAt)}.`
+            : 'Nothing due — nice work.'}
+        </Typography>
       )}
       {card && (
         <Paper sx={{ p: 3, mt: 1 }}>
@@ -983,7 +1020,7 @@ function ReviewView() {
               {status}
             </Typography>
           )}
-          {related.length > 0 && !queued && (
+          {related.length > 0 && !queued && showBack && (
             <Typography
               variant="body2"
               color="text.secondary"
@@ -1313,7 +1350,11 @@ function toLocalInput(iso: string | null | undefined): string {
 }
 
 function BrowseView() {
-  const { decks } = useDecks();
+  const { decks, refresh: refreshDecks } = useDecks();
+  const [deckSettingsError, setDeckSettingsError] = useState<string | null>(null);
+  const [deckSettingsBusy, setDeckSettingsBusy] = useState(false);
+  const [deckLimitInput, setDeckLimitInput] = useState('');
+  const [deckOrder, setDeckOrder] = useState('position');
   const [deckId, setDeckId] = useState(() => {
     try {
       return localStorage.getItem(BROWSE_DECK_KEY) ?? '';
@@ -1326,6 +1367,11 @@ function BrowseView() {
   const [loading, setLoading] = useState(false);
   const [q, setQ] = useState('');
   const [committedQ, setCommittedQ] = useState('');
+  const [tagFilter, setTagFilter] = useState('');
+  const [committedTag, setCommittedTag] = useState('');
+  const [bulkAddTags, setBulkAddTags] = useState('');
+  const [bulkRemoveTags, setBulkRemoveTags] = useState('');
+  const [bulkTagBusy, setBulkTagBusy] = useState(false);
   const [showDeleted, setShowDeleted] = useState(false);
   const [showMcpOnly, setShowMcpOnly] = useState(false);
   const [showSuspendedOnly, setShowSuspendedOnly] = useState(false);
@@ -1347,14 +1393,18 @@ function BrowseView() {
   const [detailEditError, setDetailEditError] = useState<string | null>(null);
   const [detailDue, setDetailDue] = useState('');
   const [detailSchedBusy, setDetailSchedBusy] = useState(false);
+  const [detailTags, setDetailTags] = useState('');
+  const [detailTagsBusy, setDetailTagsBusy] = useState(false);
+  const [detailTagsError, setDetailTagsError] = useState<string | null>(null);
   const [detailSchedError, setDetailSchedError] = useState<string | null>(null);
   const sentinelRef = useRef<HTMLDivElement | null>(null);
-  const stateRef = useRef({ deckId, sort: 'due' as BrowseSort, direction: 'asc' as BrowseDir, q: '', showDeleted: false, showMcpOnly: false, showSuspendedOnly: false, loading: false, total: Infinity as number });
+  const stateRef = useRef({ deckId, sort: 'due' as BrowseSort, direction: 'asc' as BrowseDir, q: '', tag: '', showDeleted: false, showMcpOnly: false, showSuspendedOnly: false, loading: false, total: Infinity as number });
   stateRef.current = {
     deckId,
     sort,
     direction,
     q: committedQ,
+    tag: committedTag,
     showDeleted,
     showMcpOnly,
     showSuspendedOnly,
@@ -1373,6 +1423,34 @@ function BrowseView() {
     }
   }, [deckId]);
 
+  const currentDeck = decks.find((d) => d.id === deckId) ?? null;
+  // Prefill the settings inputs whenever the selected deck (or list) changes.
+  useEffect(() => {
+    const d = decks.find((dd) => dd.id === deckId) ?? null;
+    setDeckLimitInput(
+      d?.new_cards_per_day == null ? '' : String(d.new_cards_per_day),
+    );
+    setDeckOrder(d?.new_order ?? 'position');
+    setDeckSettingsError(null);
+  }, [deckId, decks]);
+
+  const saveDeckSettings = async () => {
+    if (!deckId || deckSettingsBusy) return;
+    setDeckSettingsBusy(true);
+    setDeckSettingsError(null);
+    try {
+      await updateDeckSettings(deckId, {
+        new_cards_per_day: deckLimitInput.trim() === '' ? 0 : Number(deckLimitInput),
+        new_order: deckOrder,
+      });
+      await refreshDecks();
+    } catch (e) {
+      setDeckSettingsError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setDeckSettingsBusy(false);
+    }
+  };
+
   useEffect(() => {
     // A remembered deck may be gone (deleted on another device): fall back
     // to the first deck. The cards fetch for a stale id 404s harmlessly
@@ -1388,6 +1466,12 @@ function BrowseView() {
     return () => clearTimeout(timer);
   }, [q]);
 
+  // Debounce the tag filter the same way.
+  useEffect(() => {
+    const timer = setTimeout(() => setCommittedTag(tagFilter.trim().toLowerCase()), 350);
+    return () => clearTimeout(timer);
+  }, [tagFilter]);
+
   // Reset paging whenever the deck, sort, or committed search changes.
   // Default due-date ascending: due-today rows lead the table.
   useEffect(() => {
@@ -1399,7 +1483,7 @@ function BrowseView() {
     let cancelled = false;
     setLoading(true);
     setRowError(null);
-    browseCards(deckId, sort, direction, 0, BROWSE_PAGE, committedQ, showDeleted, showMcpOnly, showSuspendedOnly)
+    browseCards(deckId, sort, direction, 0, BROWSE_PAGE, committedQ, showDeleted, showMcpOnly, showSuspendedOnly, committedTag || undefined)
       .then(({ cards, total: t }) => {
         if (cancelled) return;
         setRows(cards);
@@ -1418,7 +1502,7 @@ function BrowseView() {
     return () => {
       cancelled = true;
     };
-  }, [deckId, sort, direction, committedQ, showDeleted, showMcpOnly, showSuspendedOnly]);
+  }, [deckId, sort, direction, committedQ, committedTag, showDeleted, showMcpOnly, showSuspendedOnly]);
 
   const reloadBrowse = useCallback(async () => {
     if (!deckId) return;
@@ -1426,14 +1510,14 @@ function BrowseView() {
     setRowError(null);
     try {
       const { cards, total: t } = await browseCards(
-        deckId, sort, direction, 0, BROWSE_PAGE, committedQ, showDeleted, showMcpOnly, showSuspendedOnly,
+        deckId, sort, direction, 0, BROWSE_PAGE, committedQ, showDeleted, showMcpOnly, showSuspendedOnly, committedTag || undefined,
       );
       setRows(cards);
       setTotal(t);
     } finally {
       setLoading(false);
     }
-  }, [deckId, sort, direction, committedQ, showDeleted, showMcpOnly, showSuspendedOnly]);
+  }, [deckId, sort, direction, committedQ, committedTag, showDeleted, showMcpOnly, showSuspendedOnly]);
 
   const handleRestore = async (cardId: string) => {
     setRowError(null);
@@ -1466,12 +1550,15 @@ function BrowseView() {
     setDetailEditing(false);
     setDetailDue('');
     setDetailSchedError(null);
+    setDetailTags('');
+    setDetailTagsError(null);
     setDetailLoading(true);
     getCard(detailId)
       .then((c) => {
         if (cancelled) return;
         setDetail(c);
         setDetailDue(toLocalInput(c.due));
+        setDetailTags((c.tags ?? []).join(', '));
       })
       .catch(() => {
         if (!cancelled) setDetailError('Could not load the full card detail.');
@@ -1553,6 +1640,23 @@ function BrowseView() {
     }
   };
 
+  const saveDetailTags = async () => {
+    if (!detailId || detailTagsBusy) return;
+    setDetailTagsError(null);
+    setDetailTagsBusy(true);
+    try {
+      const tags = detailTags.split(',').map((t) => t.trim()).filter(Boolean);
+      const updated = await setCardTags(detailId, tags);
+      setDetailTags(updated.tags.join(', '));
+      if (detail) setDetail({ ...detail, tags: updated.tags });
+      await reloadBrowse();
+    } catch (e) {
+      setDetailTagsError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setDetailTagsBusy(false);
+    }
+  };
+
   const handlePermanentDelete = async (cardId: string) => {
     if (!window.confirm('Permanently delete this card? Its schedule and review history are removed too. This cannot be undone.')) return;
     setRowError(null);
@@ -1598,6 +1702,29 @@ function BrowseView() {
     }
   };
 
+  /** Bulk add (or remove) comma-separated tags on the selected cards. */
+  const handleBulkTag = async (ids: string[], adding: boolean) => {
+    if (bulkTagBusy || ids.length === 0) return;
+    const raw = adding ? bulkAddTags : bulkRemoveTags;
+    const tags = raw.split(',').map((t) => t.trim()).filter(Boolean);
+    if (tags.length === 0) {
+      setRowError('Type one or more comma-separated tags first.');
+      return;
+    }
+    setRowError(null);
+    setBulkTagBusy(true);
+    try {
+      await bulkTagCards(ids, adding ? tags : [], adding ? [] : tags);
+      if (adding) setBulkAddTags('');
+      else setBulkRemoveTags('');
+      await reloadBrowse();
+    } catch (e) {
+      setRowError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBulkTagBusy(false);
+    }
+  };
+
   // Infinite scroll: load the next page when the sentinel appears.
   useEffect(() => {
     const el = sentinelRef.current;
@@ -1621,6 +1748,7 @@ function BrowseView() {
           s.showDeleted,
           s.showMcpOnly,
           s.showSuspendedOnly,
+          s.tag || undefined,
         );
         if (stopped) return;
         setRows((prev) => [...prev, ...cards]);
@@ -1730,6 +1858,45 @@ function BrowseView() {
           ))}
         </Select>
       </FormControl>
+      {currentDeck && (
+        <Box sx={{ display: 'flex', gap: 1, flexWrap: 'wrap', alignItems: 'center', mb: 1 }}>
+          <TextField
+            label={`New cards/day (now ${currentDeck.new_limit})`}
+            size="small"
+            type="number"
+            value={deckLimitInput}
+            onChange={(e) => setDeckLimitInput(e.target.value)}
+            placeholder="default"
+            sx={{ width: 220 }}
+            slotProps={{ htmlInput: { min: 0, max: 1000 } }}
+          />
+          <FormControl size="small" sx={{ minWidth: 150 }}>
+            <InputLabel id="browse-order-label">New-card order</InputLabel>
+            <Select
+              labelId="browse-order-label"
+              label="New-card order"
+              value={deckOrder}
+              onChange={(e) => setDeckOrder(e.target.value as string)}
+            >
+              <MenuItem value="position">Deck order</MenuItem>
+              <MenuItem value="newest">Newest first</MenuItem>
+            </Select>
+          </FormControl>
+          <Button
+            variant="outlined"
+            size="small"
+            onClick={() => void saveDeckSettings()}
+            disabled={deckSettingsBusy}
+          >
+            Save deck settings
+          </Button>
+        </Box>
+      )}
+      {deckSettingsError && (
+        <Alert severity="error" sx={{ mb: 1 }}>
+          {deckSettingsError}
+        </Alert>
+      )}
       <TextField
         label="Search cards"
         size="small"
@@ -1772,6 +1939,15 @@ function BrowseView() {
         }
         label="Show suspended"
       />
+      <TextField
+        label="Filter by tag"
+        size="small"
+        fullWidth
+        sx={{ mb: 1 }}
+        value={tagFilter}
+        onChange={(e) => setTagFilter(e.target.value)}
+        placeholder="e.g. biology"
+      />
       {showDeleted && (
         <Typography variant="body2" color="text.secondary" sx={{ mb: 1 }}>
           Deleted cards only — restore one, or permanently delete it (schedule
@@ -1796,10 +1972,42 @@ function BrowseView() {
         </Alert>
       )}
       {selectedVisibleIds.length > 0 && (
-        <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 1 }}>
+        <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 1, flexWrap: 'wrap' }}>
           <Typography variant="body2" color="text.secondary">
             {selectedVisibleIds.length} selected
           </Typography>
+          <TextField
+            label="Add tags"
+            size="small"
+            value={bulkAddTags}
+            onChange={(e) => setBulkAddTags(e.target.value)}
+            placeholder="comma, separated"
+            sx={{ width: 180 }}
+          />
+          <Button
+            size="small"
+            variant="outlined"
+            onClick={() => void handleBulkTag(selectedVisibleIds, true)}
+            disabled={bulkTagBusy || bulkBusy || rowBusy !== null}
+          >
+            {bulkTagBusy ? 'Tagging…' : 'Add'}
+          </Button>
+          <TextField
+            label="Remove tags"
+            size="small"
+            value={bulkRemoveTags}
+            onChange={(e) => setBulkRemoveTags(e.target.value)}
+            placeholder="comma, separated"
+            sx={{ width: 180 }}
+          />
+          <Button
+            size="small"
+            variant="outlined"
+            onClick={() => void handleBulkTag(selectedVisibleIds, false)}
+            disabled={bulkTagBusy || bulkBusy || rowBusy !== null}
+          >
+            {bulkTagBusy ? 'Tagging…' : 'Remove'}
+          </Button>
           <Button
             size="small"
             variant="outlined"
@@ -2151,6 +2359,41 @@ function BrowseView() {
                     </Alert>
                   )}
                 </Box>
+                <Box sx={{ mt: 2, pt: 2, borderTop: '1px dashed #aaa' }}>
+                  <Typography variant="subtitle2" gutterBottom>
+                    Tags
+                  </Typography>
+                  <Box
+                    sx={{
+                      display: 'flex',
+                      gap: 1,
+                      flexWrap: 'wrap',
+                      alignItems: 'center',
+                    }}
+                  >
+                    <TextField
+                      label="Tags (comma-separated)"
+                      size="small"
+                      value={detailTags}
+                      onChange={(e) => setDetailTags(e.target.value)}
+                      disabled={detailTagsBusy}
+                      sx={{ minWidth: 220, flexGrow: 1 }}
+                    />
+                    <Button
+                      variant="outlined"
+                      size="small"
+                      onClick={() => void saveDetailTags()}
+                      disabled={detailTagsBusy}
+                    >
+                      Save tags
+                    </Button>
+                  </Box>
+                  {detailTagsError && (
+                    <Alert severity="error" sx={{ mt: 1 }}>
+                      {detailTagsError}
+                    </Alert>
+                  )}
+                </Box>
               </>
             )
           ) : (
@@ -2198,12 +2441,36 @@ function AddView() {
   const [feedback, setFeedback] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [duplicates, setDuplicates] = useState<DuplicateCard[]>([]);
 
   useEffect(() => {
     if (decks.length > 0 && !deckId) {
       setDeckId(decks[0].id);
     }
   }, [decks, deckId]);
+
+  // Live near-duplicate warning as the question/answer are typed.
+  useEffect(() => {
+    if (!deckId || (!front.trim() && !back.trim())) {
+      setDuplicates([]);
+      return;
+    }
+    let cancelled = false;
+    const timer = setTimeout(() => {
+      checkDuplicates(deckId, front, back).then(
+        (dups) => {
+          if (!cancelled) setDuplicates(dups);
+        },
+        () => {
+          if (!cancelled) setDuplicates([]);
+        },
+      );
+    }, 500);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [deckId, front, back]);
 
   const submit = async () => {
     setFeedback(null);
@@ -2239,6 +2506,12 @@ function AddView() {
         value={front}
         onChange={(e) => setFront(e.target.value)}
       />
+      <Box>
+        <DictationButton
+          label="Dictate question"
+          onText={(t) => setFront((f) => (f ? `${f} ${t}` : t))}
+        />
+      </Box>
       <TextField
         label="Answer"
         multiline
@@ -2247,13 +2520,235 @@ function AddView() {
         onChange={(e) => setBack(e.target.value)}
       />
       <Box>
+        <DictationButton
+          label="Dictate answer"
+          onText={(t) => setBack((b) => (b ? `${b} ${t}` : t))}
+        />
+      </Box>
+      <Box>
         <Button variant="contained" disabled={busy} onClick={submit}>
           Add card
         </Button>
       </Box>
+      {duplicates.length > 0 && (
+        <Alert severity="warning">
+          Possible duplicate of {duplicates.length} existing card
+          {duplicates.length === 1 ? '' : 's'}:{' '}
+          {duplicates
+            .slice(0, 3)
+            .map((d) => `“${d.front_text}”`)
+            .join(', ')}
+          {duplicates.length > 3 ? ', …' : ''}
+        </Alert>
+      )}
       {feedback && <Alert severity="success">{feedback}</Alert>}
       {error && <Alert severity="error">{error}</Alert>}
     </Box>
+  );
+}
+
+function GenerateView() {
+  const { decks } = useDecks();
+  const [deckId, setDeckId] = useState('');
+  const [content, setContent] = useState('');
+  const [suggestions, setSuggestions] = useState<AiSuggestion[]>([]);
+  const [checked, setChecked] = useState<Set<number>>(new Set());
+  const [generating, setGenerating] = useState(false);
+  const [adding, setAdding] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [added, setAdded] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (decks.length > 0 && !deckId) {
+      setDeckId(decks[0].id);
+    }
+  }, [decks, deckId]);
+
+  const generate = async () => {
+    setError(null);
+    setAdded(null);
+    if (!deckId) {
+      setError('Choose a deck first.');
+      return;
+    }
+    if (!content.trim()) {
+      setError('Paste some content first.');
+      return;
+    }
+    setGenerating(true);
+    try {
+      const { suggestions: s } = await generateCards(deckId, content);
+      setSuggestions(s);
+      setChecked(new Set(s.map((_, i) => i)));
+      if (s.length === 0) setError('No cards proposed for this content.');
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setGenerating(false);
+    }
+  };
+
+  const toggle = (i: number) =>
+    setChecked((prev) => {
+      const next = new Set(prev);
+      if (next.has(i)) next.delete(i);
+      else next.add(i);
+      return next;
+    });
+
+  const addSelected = async () => {
+    setError(null);
+    setAdded(null);
+    const chosen = suggestions.filter((_, i) => checked.has(i));
+    if (chosen.length === 0) {
+      setError('Tick at least one card to add.');
+      return;
+    }
+    setAdding(true);
+    try {
+      for (const c of chosen) {
+        await createCard(deckId, c.front, c.back);
+      }
+      setAdded(`${chosen.length} card${chosen.length === 1 ? '' : 's'} added.`);
+      setSuggestions([]);
+      setChecked(new Set());
+      setContent('');
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setAdding(false);
+    }
+  };
+
+  return (
+    <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+      <Typography variant="h6">Generate cards</Typography>
+      <DeckSelect decks={decks} value={deckId} onChange={setDeckId} label="Deck" />
+      <TextField
+        label="Paste content"
+        multiline
+        fullWidth
+        minRows={6}
+        value={content}
+        onChange={(e) => setContent(e.target.value)}
+        disabled={generating || adding}
+      />
+      <Box>
+        <Button variant="contained" onClick={generate} disabled={generating || adding}>
+          {generating ? 'Generating…' : 'Propose cards'}
+        </Button>
+      </Box>
+      {suggestions.length > 0 && (
+        <>
+          <Typography variant="subtitle1">
+            Proposed cards — tick the ones to keep
+          </Typography>
+          {suggestions.map((s, i) => (
+            <Paper key={i} sx={{ p: 1.5 }}>
+              <Box sx={{ display: 'flex', gap: 1, alignItems: 'flex-start' }}>
+                <Checkbox
+                  inputProps={{ 'aria-label': `Keep proposal ${i + 1}` }}
+                  checked={checked.has(i)}
+                  onChange={() => toggle(i)}
+                />
+                <Box>
+                  <Typography sx={{ fontWeight: 600 }}>{s.front}</Typography>
+                  <Typography color="text.secondary">{s.back}</Typography>
+                </Box>
+              </Box>
+            </Paper>
+          ))}
+          <Box>
+            <Button
+              variant="contained"
+              color="success"
+              onClick={addSelected}
+              disabled={adding || checked.size === 0}
+            >
+              {adding ? 'Adding…' : `Add ${checked.size} selected`}
+            </Button>
+          </Box>
+        </>
+      )}
+      {added && <Alert severity="success">{added}</Alert>}
+      {error && <Alert severity="error">{error}</Alert>}
+    </Box>
+  );
+}
+
+/**
+ * Push-to-talk dictation via the browser's built-in speech recognition
+ * (the same capability grimoire gets from its server speech endpoint,
+ * which smarthole does not run). Final transcripts are appended through
+ * `onText`; the button hides itself where recognition is unavailable.
+ */
+function DictationButton({
+  onText,
+  label,
+}: {
+  onText: (text: string) => void;
+  label: string;
+}) {
+  const recRef = useRef<{ stop: () => void } | null>(null);
+  const [listening, setListening] = useState(false);
+  const supported =
+    typeof window !== 'undefined' &&
+    Boolean(
+      (window as unknown as Record<string, unknown>).SpeechRecognition ||
+        (window as unknown as Record<string, unknown>).webkitSpeechRecognition,
+    );
+
+  useEffect(
+    () => () => {
+      try {
+        recRef.current?.stop();
+      } catch {
+        // Never mounted a recognizer: nothing to stop.
+      }
+    },
+    [],
+  );
+
+  if (!supported) return null;
+
+  const toggle = () => {
+    if (listening) {
+      try {
+        recRef.current?.stop();
+      } finally {
+        setListening(false);
+      }
+      return;
+    }
+    const w = window as unknown as Record<string, any>;
+    const Ctor = w.SpeechRecognition || w.webkitSpeechRecognition;
+    if (!Ctor) return;
+    const rec = new Ctor();
+    rec.lang = 'en-US';
+    rec.interimResults = true;
+    rec.continuous = false;
+    rec.onresult = (e: any) => {
+      let finalText = '';
+      for (let i = e.resultIndex; i < e.results.length; i += 1) {
+        if (e.results[i].isFinal) finalText += e.results[i][0].transcript;
+      }
+      if (finalText) onText(finalText);
+    };
+    rec.onend = () => setListening(false);
+    rec.onerror = () => setListening(false);
+    recRef.current = rec;
+    try {
+      rec.start();
+      setListening(true);
+    } catch {
+      setListening(false);
+    }
+  };
+
+  return (
+    <Button variant="outlined" size="small" onClick={toggle}>
+      {listening ? 'Stop dictation' : label}
+    </Button>
   );
 }
 
@@ -2396,13 +2891,120 @@ function StatsView() {
   const [stats, setStats] = useState<Stats | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [buildInfo, setBuildInfo] = useState<BuildInfo | null>(null);
+  const [prefs, setPrefs] = useState<Preferences | null>(null);
+  const [goalInput, setGoalInput] = useState('');
+  const [prefsBusy, setPrefsBusy] = useState(false);
+  const [prefsError, setPrefsError] = useState<string | null>(null);
+  const [prefsSaved, setPrefsSaved] = useState(false);
+  const [fsrs, setFsrs] = useState<FsrsStatus | null>(null);
+  const [fsrsBusy, setFsrsBusy] = useState(false);
+  const [fsrsError, setFsrsError] = useState<string | null>(null);
+  const [fsrsNote, setFsrsNote] = useState<string | null>(null);
+  const [learnInput, setLearnInput] = useState('');
+  const [relearnInput, setRelearnInput] = useState('');
 
   useEffect(() => {
     getStats().then(setStats, (e) =>
       setError(e instanceof Error ? e.message : String(e)),
     );
     getBuildInfo().then(setBuildInfo, () => undefined);
+    getPreferences().then(
+      (p) => {
+        setPrefs(p);
+        setGoalInput(String(p.daily_goal));
+      },
+      () => undefined,
+    );
+    getFsrsStatus().then(
+      (f) => {
+        setFsrs(f);
+        setLearnInput((f.learning_steps ?? []).join(', '));
+        setRelearnInput((f.relearning_steps ?? []).join(', '));
+      },
+      () => undefined,
+    );
   }, []);
+
+  const saveSteps = async () => {
+    const parse = (s: string) =>
+      s.split(',').map((x) => Number(x.trim())).filter((x) => Number.isFinite(x));
+    setFsrsBusy(true);
+    setFsrsError(null);
+    setFsrsNote(null);
+    try {
+      const r = await updateFsrsSettings({
+        learning_steps: parse(learnInput),
+        relearning_steps: parse(relearnInput),
+      });
+      setLearnInput(r.learning_steps.join(', '));
+      setRelearnInput(r.relearning_steps.join(', '));
+      setFsrs(await getFsrsStatus());
+      setFsrsNote('Learning steps updated.');
+    } catch (e) {
+      setFsrsError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setFsrsBusy(false);
+    }
+  };
+
+  const runFsrs = async (action: 'optimize' | 'reschedule' | 'reset') => {
+    if (
+      action !== 'optimize' &&
+      !window.confirm(
+        action === 'reschedule'
+          ? 'Replay every reviewed card through the current scheduler? Due dates will change.'
+          : 'Forget tuned weights and return to library defaults?',
+      )
+    ) {
+      return;
+    }
+    setFsrsBusy(true);
+    setFsrsError(null);
+    setFsrsNote(null);
+    try {
+      if (action === 'optimize') {
+        const r = await optimizeFsrs();
+        setFsrsNote(
+          `Tuned on ${r.reviews_used} reviews: log-loss ${r.log_loss_before.toFixed(4)} → ${r.log_loss_after.toFixed(4)}.`,
+        );
+        setFsrs(await getFsrsStatus());
+      } else if (action === 'reschedule') {
+        const r = await rescheduleFsrs();
+        setFsrsNote(`Rescheduled ${r.rescheduled} card${r.rescheduled === 1 ? '' : 's'}.`);
+        getStats().then(setStats, () => undefined);
+      } else {
+        await resetFsrs();
+        const f = await getFsrsStatus();
+        setFsrs(f);
+        setLearnInput((f.learning_steps ?? []).join(', '));
+        setRelearnInput((f.relearning_steps ?? []).join(', '));
+        setFsrsNote('Back to library defaults.');
+      }
+    } catch (e) {
+      setFsrsError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setFsrsBusy(false);
+    }
+  };
+
+  const savePrefs = async (next: Partial<Preferences>) => {
+    setPrefsBusy(true);
+    setPrefsError(null);
+    setPrefsSaved(false);
+    try {
+      const updated = await updatePreferences(next);
+      setPrefs(updated);
+      setGoalInput(String(updated.daily_goal));
+      setStats((s) =>
+        s && s.goal ? { ...s, goal: { ...s.goal, target: updated.daily_goal } } : s,
+      );
+      setPrefsSaved(true);
+    } catch (e) {
+      setPrefsError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setPrefsBusy(false);
+    }
+  };
 
   if (error) {
     return <Alert severity="error">{error}</Alert>;
@@ -2425,7 +3027,9 @@ function StatsView() {
       stats.today.accuracy === null ? '—' : `${stats.today.accuracy}%`,
     ],
     ['Total cards', String(stats.totals.cards)],
+    ['Day streak', stats.streak == null ? '—' : String(stats.streak)],
   ];
+  const goal = stats.goal;
   return (
     <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
       <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 2 }}>
@@ -2435,7 +3039,94 @@ function StatsView() {
             <Typography color="text.secondary">{label}</Typography>
           </Paper>
         ))}
+        {goal && (
+          <Paper data-testid="daily-goal" sx={{ p: 2, minWidth: 140, flex: '1 1 140px' }}>
+            <Typography variant="h5">
+              {goal.studied}/{goal.target}
+            </Typography>
+            <Typography color="text.secondary">Daily goal</Typography>
+            <LinearProgress
+              variant="determinate"
+              value={Math.min(100, (goal.studied / Math.max(1, goal.target)) * 100)}
+              sx={{ mt: 1 }}
+            />
+          </Paper>
+        )}
       </Box>
+      <Typography variant="h6">Goals &amp; reminders</Typography>
+      <Box sx={{ display: 'flex', gap: 1, flexWrap: 'wrap', alignItems: 'center' }}>
+        <TextField
+          label="Daily goal (cards)"
+          size="small"
+          type="number"
+          value={goalInput}
+          onChange={(e) => setGoalInput(e.target.value)}
+          sx={{ width: 160 }}
+          slotProps={{ htmlInput: { min: 1, max: 1000 } }}
+        />
+        <Button
+          variant="outlined"
+          size="small"
+          disabled={prefsBusy}
+          onClick={() => void savePrefs({ daily_goal: Number(goalInput) })}
+        >
+          Save goal
+        </Button>
+        <FormControlLabel
+          control={
+            <Checkbox
+              checked={prefs?.reminder_enabled ?? false}
+              disabled={prefsBusy || prefs === null}
+              onChange={(e) => void savePrefs({ reminder_enabled: e.target.checked })}
+            />
+          }
+          label="Email me when I haven't studied"
+        />
+      </Box>
+      {prefsSaved && <Alert severity="success">Preferences saved.</Alert>}
+      {prefsError && <Alert severity="error">{prefsError}</Alert>}
+      <Typography variant="h6">Scheduler</Typography>
+      <Typography variant="body2" color="text.secondary" data-testid="fsrs-status">
+        {fsrs
+          ? fsrs.custom
+            ? `Tuned weights (on ${fsrs.reviews_used} reviews${fsrs.updated_at ? `, ${fmtDate(fsrs.updated_at)}` : ''}).`
+            : `Library defaults (${fsrs.review_count} graded reviews on record).`
+          : 'Loading scheduler…'}
+      </Typography>
+      <Box sx={{ display: 'flex', gap: 1, flexWrap: 'wrap' }}>
+        <Button variant="outlined" size="small" disabled={fsrsBusy} onClick={() => void runFsrs('optimize')}>
+          {fsrsBusy ? 'Optimizing…' : 'Optimize on my reviews'}
+        </Button>
+        <Button variant="outlined" size="small" disabled={fsrsBusy} onClick={() => void runFsrs('reschedule')}>
+          Reschedule reviewed cards
+        </Button>
+        <Button variant="outlined" size="small" disabled={fsrsBusy || !fsrs?.custom} onClick={() => void runFsrs('reset')}>
+          Reset to defaults
+        </Button>
+      </Box>
+      <Box sx={{ display: 'flex', gap: 1, flexWrap: 'wrap', alignItems: 'center' }}>
+        <TextField
+          label="Learning steps (min)"
+          size="small"
+          value={learnInput}
+          onChange={(e) => setLearnInput(e.target.value)}
+          placeholder="1, 10"
+          sx={{ width: 200 }}
+        />
+        <TextField
+          label="Relearning steps (min)"
+          size="small"
+          value={relearnInput}
+          onChange={(e) => setRelearnInput(e.target.value)}
+          placeholder="10"
+          sx={{ width: 200 }}
+        />
+        <Button variant="outlined" size="small" disabled={fsrsBusy} onClick={() => void saveSteps()}>
+          Save steps
+        </Button>
+      </Box>
+      {fsrsNote && <Alert severity="success">{fsrsNote}</Alert>}
+      {fsrsError && <Alert severity="error">{fsrsError}</Alert>}
       <Typography variant="h6">Due forecast</Typography>
       <Box
         data-testid="due-forecast-chart"
@@ -2546,11 +3237,250 @@ function StatsView() {
           </Box>
         </>
       )}
+      <Typography variant="h6">Review activity</Typography>
+      <Box
+        data-testid="review-heatmap"
+        sx={{
+          display: 'flex',
+          gap: '2px',
+          width: '100%',
+          overflowX: 'hidden',
+          pb: 1,
+        }}
+      >
+        {(() => {
+          const dayMs = 86400000;
+          const end = new Date();
+          end.setHours(0, 0, 0, 0);
+          const start = new Date(end.getTime() - 370 * dayMs);
+          start.setDate(start.getDate() - start.getDay());
+          const pad = (n: number) => String(n).padStart(2, '0');
+          const isoLocal = (d: Date) =>
+            `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+          const byDate = new Map(
+            (stats.review_history ?? []).map((h) => [h.date, h.reviews]),
+          );
+          const maxReviews = Math.max(1, ...[...byDate.values()]);
+          const level = (n: number) =>
+            n === 0 ? 0 : 1 + Math.min(3, Math.floor((n / maxReviews) * 4));
+          const columns: ({ date: string } | null)[][] = [];
+          const cursor = new Date(start);
+          while (cursor <= end) {
+            const col: ({ date: string } | null)[] = [];
+            for (let i = 0; i < 7; i += 1) {
+              col.push(cursor <= end ? { date: isoLocal(cursor) } : null);
+              cursor.setDate(cursor.getDate() + 1);
+            }
+            columns.push(col);
+          }
+          return columns.map((col, ci) => (
+            <Box
+              key={ci}
+              sx={{ flex: '1 1 0', minWidth: 0, display: 'flex', flexDirection: 'column', gap: '2px' }}
+            >
+              {col.map((cell, ri) =>
+                cell === null ? (
+                  <Box key={ri} sx={{ aspectRatio: '1', width: '100%' }} />
+                ) : (
+                  (() => {
+                    const n = byDate.get(cell.date) ?? 0;
+                    const lv = level(n);
+                    return (
+                      <Box
+                        key={ri}
+                        title={`${fmtDate(cell.date)}: ${n} review${n === 1 ? '' : 's'}`}
+                        sx={{
+                          aspectRatio: '1',
+                          width: '100%',
+                          borderRadius: '2px',
+                          bgcolor: lv === 0 ? 'action.hover' : 'success.main',
+                          opacity: lv === 0 ? 1 : 0.2 + lv * 0.2,
+                        }}
+                      />
+                    );
+                  })()
+                ),
+              )}
+            </Box>
+          ));
+        })()}
+      </Box>
+      <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+        <Typography variant="caption" color="text.secondary">Less</Typography>
+        {[0, 1, 2, 3, 4].map((lv) => (
+          <Box
+            key={lv}
+            sx={{
+              width: 10,
+              height: 10,
+              borderRadius: '2px',
+              bgcolor: lv === 0 ? 'action.hover' : 'success.main',
+              opacity: lv === 0 ? 1 : 0.2 + lv * 0.2,
+            }}
+          />
+        ))}
+        <Typography variant="caption" color="text.secondary">More</Typography>
+      </Box>
+      {stats.retention && (
+        <>
+          <Typography variant="h6">True retention</Typography>
+          <TableContainer>
+            <Table size="small" data-testid="retention-table">
+              <TableHead>
+                <TableRow>
+                  <TableCell>Cards</TableCell>
+                  <TableCell sx={{ textAlign: 'right' }}>Reviews</TableCell>
+                  <TableCell sx={{ textAlign: 'right' }}>Retention</TableCell>
+                </TableRow>
+              </TableHead>
+              <TableBody>
+                {stats.retention.map((r) => (
+                  <TableRow key={r.bucket}>
+                    <TableCell sx={{ textTransform: 'capitalize' }}>{r.bucket}</TableCell>
+                    <TableCell sx={{ textAlign: 'right' }}>{r.reviews}</TableCell>
+                    <TableCell sx={{ textAlign: 'right' }}>
+                      {r.rate === null ? '—' : `${r.rate}%`}
+                    </TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          </TableContainer>
+        </>
+      )}
+      {stats.workload && stats.workload.length > 0 && (
+        <>
+          <Typography variant="h6">Forecast workload</Typography>
+          <TableContainer>
+            <Table size="small" data-testid="workload-table">
+              <TableHead>
+                <TableRow>
+                  <TableCell>Day</TableCell>
+                  <TableCell sx={{ textAlign: 'right' }}>Due</TableCell>
+                  <TableCell sx={{ textAlign: 'right' }}>New</TableCell>
+                  <TableCell sx={{ textAlign: 'right' }}>Total</TableCell>
+                </TableRow>
+              </TableHead>
+              <TableBody>
+                {stats.workload.slice(0, 14).map((w) => (
+                  <TableRow key={w.date}>
+                    <TableCell>{fmtDate(w.date)}</TableCell>
+                    <TableCell sx={{ textAlign: 'right' }}>{w.due}</TableCell>
+                    <TableCell sx={{ textAlign: 'right' }}>{w.new}</TableCell>
+                    <TableCell sx={{ textAlign: 'right' }}>{w.due + w.new}</TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          </TableContainer>
+        </>
+      )}
+      <Typography variant="h6">Calendar</Typography>
+      <StatsCalendar
+        history={stats.review_history ?? []}
+        forecast={stats.forecast}
+      />
       <Typography variant="caption" color="text.secondary" data-testid="build-info">
         {buildInfo
           ? `Server deployed ${fmtDateTime(buildInfo.server_started_at)}${buildInfo.server_git_sha ? ` (${buildInfo.server_git_sha})` : ''} · UI built ${fmtDateTime(UI_BUILD_AT)}`
           : `UI built ${fmtDateTime(UI_BUILD_AT)}`}
       </Typography>
+    </Box>
+  );
+}
+
+function StatsCalendar({
+  history,
+  forecast,
+}: {
+  history: Array<{ date: string; reviews: number }>;
+  forecast: Array<{ date: string; due: number }>;
+}) {
+  const [offset, setOffset] = useState(0);
+  const base = new Date();
+  base.setDate(1);
+  base.setMonth(base.getMonth() + offset);
+  const year = base.getFullYear();
+  const month = base.getMonth();
+  const firstDow = new Date(year, month, 1).getDay();
+  const daysInMonth = new Date(year, month + 1, 0).getDate();
+  const pad = (n: number) => String(n).padStart(2, '0');
+  const iso = (d: number) => `${year}-${pad(month + 1)}-${pad(d)}`;
+  const studiedByDate = new Map(history.map((h) => [h.date, h.reviews]));
+  const dueByDate = new Map(forecast.map((f) => [f.date, f.due]));
+  const todayIso = (() => {
+    const t = new Date();
+    return `${t.getFullYear()}-${pad(t.getMonth() + 1)}-${pad(t.getDate())}`;
+  })();
+  const cells: ({ day: number } | null)[] = [
+    ...Array<null>(firstDow).fill(null),
+    ...Array.from({ length: daysInMonth }, (_, i) => ({ day: i + 1 })),
+  ];
+  while (cells.length % 7 !== 0) cells.push(null);
+  return (
+    <Box data-testid="stats-calendar">
+      <Box sx={{ display: 'flex', gap: 1, alignItems: 'center', mb: 1 }}>
+        <Button size="small" onClick={() => setOffset((o) => o - 1)} aria-label="Previous month">
+          ‹
+        </Button>
+        <Typography variant="subtitle1">
+          {base.toLocaleString('default', { month: 'long', year: 'numeric' })}
+        </Typography>
+        <Button size="small" onClick={() => setOffset((o) => o + 1)} aria-label="Next month">
+          ›
+        </Button>
+        {offset !== 0 && (
+          <Button size="small" onClick={() => setOffset(0)}>
+            Today
+          </Button>
+        )}
+      </Box>
+      <Box sx={{ display: 'grid', gridTemplateColumns: 'repeat(7, 1fr)', gap: '2px' }}>
+        {['S', 'M', 'T', 'W', 'T', 'F', 'S'].map((d, i) => (
+          <Typography key={i} variant="caption" color="text.secondary" sx={{ textAlign: 'center' }}>
+            {d}
+          </Typography>
+        ))}
+        {cells.map((cell, i) =>
+          cell === null ? (
+            <Box key={i} />
+          ) : (
+            (() => {
+              const date = iso(cell.day);
+              const studied = studiedByDate.get(date) ?? 0;
+              const due = dueByDate.get(date) ?? 0;
+              const isToday = date === todayIso;
+              return (
+                <Box
+                  key={i}
+                  title={
+                    studied > 0
+                      ? `${fmtDate(date)}: ${studied} review${studied === 1 ? '' : 's'}`
+                      : due > 0
+                        ? `${fmtDate(date)}: ${due} due`
+                        : fmtDate(date)
+                  }
+                  sx={{
+                    aspectRatio: '1',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    borderRadius: '4px',
+                    border: isToday ? '2px solid' : '1px solid transparent',
+                    borderColor: isToday ? 'primary.main' : 'transparent',
+                    bgcolor: studied > 0 ? 'success.main' : due > 0 ? 'info.main' : 'action.hover',
+                    opacity: studied > 0 || due > 0 ? 0.85 : 1,
+                    color: studied > 0 || due > 0 ? 'common.white' : 'text.primary',
+                    fontSize: '0.75rem',
+                  }}
+                >
+                  {cell.day}
+                </Box>
+              );
+            })()
+          ),
+        )}
+      </Box>
     </Box>
   );
 }
@@ -2568,25 +3498,9 @@ function FeedbackView() {
   const [committedEmail, setCommittedEmail] = useState('');
   const [listError, setListError] = useState<string | null>(null);
   const [exportBusy, setExportBusy] = useState(false);
-  const [listening, setListening] = useState(false);
-  const recRef = useRef<{ stop: () => void } | null>(null);
-
-  const speechSupported =
-    typeof window !== 'undefined' &&
-    Boolean(
-      (window as unknown as Record<string, unknown>).SpeechRecognition ||
-        (window as unknown as Record<string, unknown>).webkitSpeechRecognition,
-    );
 
   useEffect(() => {
     getOwnFeedback().then(setMine, () => undefined);
-    return () => {
-      try {
-        recRef.current?.stop();
-      } catch {
-        // Never mounted a recognizer: nothing to stop.
-      }
-    };
   }, []);
 
   // Debounce the admin email filter into a server-side query.
@@ -2621,40 +3535,6 @@ function FeedbackView() {
       cancelled = true;
     };
   }, [statusFilter, committedEmail]);
-
-  const toggleListen = () => {
-    if (listening) {
-      try {
-        recRef.current?.stop();
-      } finally {
-        setListening(false);
-      }
-      return;
-    }
-    const w = window as unknown as Record<string, any>;
-    const Ctor = w.SpeechRecognition || w.webkitSpeechRecognition;
-    if (!Ctor) return;
-    const rec = new Ctor();
-    rec.lang = 'en-US';
-    rec.interimResults = true;
-    rec.continuous = false;
-    rec.onresult = (e: any) => {
-      let finalText = '';
-      for (let i = e.resultIndex; i < e.results.length; i += 1) {
-        if (e.results[i].isFinal) finalText += e.results[i][0].transcript;
-      }
-      if (finalText) setText((t) => (t ? `${t} ${finalText}` : finalText));
-    };
-    rec.onend = () => setListening(false);
-    rec.onerror = () => setListening(false);
-    recRef.current = rec;
-    try {
-      rec.start();
-      setListening(true);
-    } catch {
-      setListening(false);
-    }
-  };
 
   const submit = async () => {
     const body = text.trim();
@@ -2715,18 +3595,11 @@ function FeedbackView() {
         <Button variant="contained" onClick={submit} disabled={busy || !text.trim()}>
           {busy ? 'Sending…' : 'Submit'}
         </Button>
-        {speechSupported && (
-          <Button variant="outlined" onClick={toggleListen}>
-            {listening ? 'Stop dictation' : 'Dictate by voice'}
-          </Button>
-        )}
+        <DictationButton
+          label="Dictate by voice"
+          onText={(t) => setText((prev) => (prev ? `${prev} ${t}` : t))}
+        />
       </Box>
-      {!speechSupported && (
-        <Typography variant="caption" color="text.secondary">
-          Voice dictation is not available in this browser — type your feedback
-          instead.
-        </Typography>
-      )}
       {error && <Alert severity="error">{error}</Alert>}
       <Typography variant="h6">{all ? 'All feedback' : 'My feedback'}</Typography>
       {all && (

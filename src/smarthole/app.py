@@ -40,6 +40,7 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 
 from . import ai_review, apkg_import, embeddings, fsrs_service, mongo_connection
+from . import reminders as reminders_service
 from .auth import (
     SESSION_COOKIE,
     SESSION_DAYS,
@@ -108,6 +109,55 @@ class DueBody(BaseModel):
 class AiReviewBody(BaseModel):
     mode: Literal["split", "custom"] = "split"
     question: str | None = None
+
+
+class GenerateBody(BaseModel):
+    deck_id: str
+    content: str
+
+
+class PreferencesBody(BaseModel):
+    daily_goal: int | None = None
+    reminder_enabled: bool | None = None
+
+
+class DeckSettingsBody(BaseModel):
+    new_cards_per_day: int | None = None
+    new_order: str | None = None
+
+
+class FsrsSettingsBody(BaseModel):
+    learning_steps: list[int] | None = None
+    relearning_steps: list[int] | None = None
+
+
+class CardTagsBody(BaseModel):
+    tags: list[str]
+
+
+class BulkTagsBody(BaseModel):
+    card_ids: list[str]
+    add: list[str] | None = None
+    remove: list[str] | None = None
+
+
+MAX_TAGS_PER_CARD = 20
+MAX_TAG_LENGTH = 50
+
+
+def normalize_tags(values: list[str] | None) -> list[str]:
+    """Lowercase, strip, dedupe; raise ValueError on too many/long tags."""
+    cleaned = []
+    for value in values or []:
+        tag = (value or "").strip().lower()
+        if tag and tag not in cleaned:
+            cleaned.append(tag)
+    if len(cleaned) > MAX_TAGS_PER_CARD:
+        raise ValueError(f"At most {MAX_TAGS_PER_CARD} tags per card")
+    for tag in cleaned:
+        if len(tag) > MAX_TAG_LENGTH:
+            raise ValueError(f'Tag "{tag}" exceeds {MAX_TAG_LENGTH} characters')
+    return cleaned
 
 
 class ChatHistoryMessage(BaseModel):
@@ -397,13 +447,22 @@ def create_app() -> FastAPI:
                     active_ids.append(card_id)
             cards_by_deck[key] = card_ids
             active_by_deck[key] = active_ids
-        # One state query for all decks; per-deck due/new/due_today tallies
-        # are computed in Python. Raw collection access keeps the card
-        # reference as an id (ORM access would fetch every Card document).
+        # One state query for all decks; per-deck due/new/due_today/new_due
+        # tallies are computed in Python. Raw collection access keeps the
+        # card reference as an id (ORM access would fetch every Card
+        # document, embeddings included).
         now = utcnow()
-        tomorrow = _day_start() + timedelta(days=1)
+        day_start = _day_start()
+        tomorrow = day_start + timedelta(days=1)
         counts: dict[str, dict[str, int]] = {
-            str(deck.id): {"due": 0, "new": 0, "due_today": 0} for deck in decks
+            str(deck.id): {
+                "due": 0,
+                "new": 0,
+                "due_today": 0,
+                "introduced": 0,
+                "unseen_due": 0,
+            }
+            for deck in decks
         }
         deck_of: dict = {}
         for key, ids in active_by_deck.items():
@@ -414,18 +473,29 @@ def create_app() -> FastAPI:
             coll = CardState._get_collection()
             for s in coll.find(
                 {"user": user.id, "card": {"$in": all_active}},
-                {"card": 1, "reps": 1, "due": 1},
+                {"card": 1, "reps": 1, "due": 1, "introduced_at": 1},
             ):
                 entry = counts.get(deck_of.get(s["card"]))
                 if entry is None:
                     continue
                 reps = s.get("reps") or 0
                 due = s.get("due")
-                if reps > 0 and due is not None and fsrs_service.ensure_aware(due) <= now:
+                aware_due = (
+                    fsrs_service.ensure_aware(due) if due is not None else None
+                )
+                if reps > 0 and aware_due is not None and aware_due <= now:
                     entry["due"] += 1
                 if reps == 0:
                     entry["new"] += 1
-                if reps > 0 and due is not None and fsrs_service.ensure_aware(due) < tomorrow:
+                    if aware_due is not None and aware_due <= now:
+                        entry["unseen_due"] += 1
+                introduced = s.get("introduced_at")
+                if (
+                    introduced is not None
+                    and fsrs_service.ensure_aware(introduced) >= day_start
+                ):
+                    entry["introduced"] += 1
+                if reps > 0 and aware_due is not None and aware_due < tomorrow:
                     entry["due_today"] += 1
         out = []
         for deck in decks:
@@ -439,9 +509,54 @@ def create_app() -> FastAPI:
                     "due": entry["due"],
                     "due_today": entry["due_today"],
                     "new": entry["new"],
+                    "new_cards_per_day": deck.new_cards_per_day,
+                    "new_order": _deck_new_order(deck),
+                    "new_limit": _deck_new_limit(deck),
+                    "new_due": min(
+                        entry["unseen_due"],
+                        max(0, _deck_new_limit(deck) - entry["introduced"]),
+                    ),
                 }
             )
         return {"decks": out}
+
+    @app.put("/api/decks/{deck_id}")
+    def update_deck(
+        body: DeckSettingsBody, deck_id: str, user: User = Depends(get_current_user)
+    ):
+        """Update a deck's new-card budget and gather order (partial)."""
+        try:
+            deck = Deck.objects(owner=user, id=deck_id).first()
+        except Exception:
+            deck = None
+        if deck is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Deck not found")
+        if body.new_cards_per_day is not None:
+            if body.new_cards_per_day == 0:
+                deck.update(unset__new_cards_per_day=True)
+                deck.reload()
+            else:
+                if not 1 <= body.new_cards_per_day <= 1000:
+                    raise HTTPException(
+                        status.HTTP_400_BAD_REQUEST,
+                        "new_cards_per_day must be 1-1000 (0 resets to default)",
+                    )
+                deck.update(set__new_cards_per_day=body.new_cards_per_day)
+        if body.new_order is not None:
+            if body.new_order not in ("position", "newest"):
+                raise HTTPException(
+                    status.HTTP_400_BAD_REQUEST,
+                    'new_order must be "position" or "newest"',
+                )
+            deck.update(set__new_order=body.new_order)
+        deck.reload()
+        return {
+            "id": str(deck.id),
+            "name": deck.name,
+            "new_cards_per_day": deck.new_cards_per_day,
+            "new_order": _deck_new_order(deck),
+            "new_limit": _deck_new_limit(deck),
+        }
 
     @app.get("/api/decks/{deck_id}/cards")
     def browse_deck(
@@ -456,11 +571,14 @@ def create_app() -> FastAPI:
         show_deleted: bool = Query(default=False),
         mcp_only: bool = Query(default=False),
         suspended_only: bool = Query(default=False),
+        tag: str | None = Query(default=None),
         user: User = Depends(get_current_user),
     ):
         deck = Deck.objects(owner=user, id=deck_id).first()
         if deck is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "Deck not found")
+        # Single-tag filter (exact, lowercased like stored tags).
+        tag_needle = (tag or "").strip().lower() or None
         # Default view hides logically deleted cards; show_deleted=True
         # shows *only* deleted cards (for restore / permanent delete).
         # __ne matches pre-migration cards that lack the field entirely.
@@ -475,6 +593,8 @@ def create_app() -> FastAPI:
             cards_query = cards_query.filter(created_via_mcp=True)
         if suspended_only:
             cards_query = cards_query.filter(suspended=True)
+        if tag_needle:
+            cards_query = cards_query.filter(tags=tag_needle)
         if q and q.strip():
             needle = q.strip()
             cards_query = cards_query.filter(
@@ -530,6 +650,7 @@ def create_app() -> FastAPI:
                 "reps": state.reps,
                 "suspended": card.suspended,
                 "deleted": bool(card.deleted),
+                "tags": list(card.tags or []),
                 "created_via_mcp": bool(getattr(card, "created_via_mcp", False)),
                 "due_today": (
                     state.reps > 0
@@ -558,6 +679,7 @@ def create_app() -> FastAPI:
             and not show_deleted
             and not mcp_only
             and not suspended_only
+            and not tag_needle
         ):
             try:
                 query_vector, _ = embeddings.embed_text(
@@ -595,6 +717,82 @@ def create_app() -> FastAPI:
             except Exception as exc:
                 logger.warning("browse similarity search unavailable: %s", exc)
         return {"cards": rows, "total": total + extra_similar}
+
+    @app.get("/api/decks/{deck_id}/duplicates")
+    def check_duplicates(
+        deck_id: str,
+        front: str = Query(default=""),
+        back: str = Query(default=""),
+        user: User = Depends(get_current_user),
+    ):
+        """Warn about existing cards near-identical to a prospective new one.
+
+        Exact substring matches come first (kind "exact"); embedding-similar
+        cards above the related threshold follow (kind "similar"). The
+        similarity part degrades to exact-only when embeddings are
+        unavailable — a warning is better than none.
+        """
+        deck = Deck.objects(owner=user, id=deck_id).first()
+        if deck is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Deck not found")
+        needle_front = (front or "").strip()
+        needle_back = (back or "").strip()
+        if not needle_front and not needle_back:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                "Provide front and/or back text to check",
+            )
+        exact_ids: set = set()
+        duplicates = []
+        exact_query = Card.objects(deck=deck, deleted__ne=True)
+        if needle_front and needle_back:
+            exact_query = exact_query.filter(
+                Q(front_html__icontains=needle_front)
+                | Q(back_html__icontains=needle_back)
+            )
+        elif needle_front:
+            exact_query = exact_query.filter(
+                front_html__icontains=needle_front
+            )
+        else:
+            exact_query = exact_query.filter(back_html__icontains=needle_back)
+        for card in exact_query.limit(5):
+            exact_ids.add(str(card.id))
+            duplicates.append(
+                {
+                    "card_id": str(card.id),
+                    "front_text": plain_text(card.front_html),
+                    "kind": "exact",
+                    "score": None,
+                }
+            )
+        try:
+            query_vector, _ = embeddings.embed_text(
+                embeddings.card_embedding_text(needle_front, needle_back)
+            )
+            similar = embeddings.similar_cards(
+                Card._get_collection(),
+                query_vector,
+                deck_ids=[deck.id],
+                limit=5,
+                min_score=_related_min_score(),
+            )
+        except Exception as exc:
+            logger.warning("duplicate similarity check unavailable: %s", exc)
+            similar = []
+        for hit in similar:
+            hid = str(hit["_id"])
+            if hid in exact_ids:
+                continue
+            duplicates.append(
+                {
+                    "card_id": hid,
+                    "front_text": plain_text(hit.get("front_html") or ""),
+                    "kind": "similar",
+                    "score": round(float(hit.get("score") or 0), 4),
+                }
+            )
+        return {"duplicates": duplicates}
 
     @app.post("/api/cards", status_code=201)
     def create_card(body: CardBody, user: User = Depends(get_current_user)):
@@ -655,6 +853,60 @@ def create_app() -> FastAPI:
             "front_html": card.front_html,
             "back_html": card.back_html,
         }
+
+    @app.patch("/api/cards/{card_id}/tags")
+    def set_card_tags(
+        card_id: str, body: CardTagsBody, user: User = Depends(get_current_user)
+    ):
+        """Replace a card's tags (lowercased, deduped)."""
+        try:
+            tags = normalize_tags(body.tags)
+        except ValueError as exc:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+        try:
+            card = Card.objects(id=card_id).first()
+        except Exception:
+            card = None
+        if card is None or card.deck.owner.id != user.id or card.deleted:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Card not found")
+        card.update(set__tags=tags)
+        card.reload()
+        return {"card_id": str(card.id), "tags": list(card.tags or [])}
+
+    @app.post("/api/cards/bulk-tags")
+    def bulk_tag_cards(
+        body: BulkTagsBody, user: User = Depends(get_current_user)
+    ):
+        """Add and/or remove tags on many cards at once."""
+        try:
+            add = normalize_tags(body.add)
+            remove = normalize_tags(body.remove)
+        except ValueError as exc:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+        if not body.card_ids:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST, "card_ids must be non-empty"
+            )
+        updated = 0
+        for card_id in set(body.card_ids):
+            try:
+                card = Card.objects(id=card_id).first()
+            except Exception:
+                card = None
+            if card is None or card.deck.owner.id != user.id or card.deleted:
+                continue
+            current = list(card.tags or [])
+            for tag in add:
+                if tag not in current:
+                    current.append(tag)
+            current = [tag for tag in current if tag not in remove]
+            try:
+                normalize_tags(current)
+            except ValueError:
+                continue
+            card.update(set__tags=current)
+            updated += 1
+        return {"updated": updated}
 
     @app.post("/api/cards/{card_id}/ai-review")
     def ai_review_card(
@@ -767,6 +1019,45 @@ def create_app() -> FastAPI:
         return StreamingResponse(
             stream_lines(), media_type="application/x-ndjson"
         )
+
+    @app.post("/api/cards/generate")
+    def generate_cards(body: GenerateBody, user: User = Depends(get_current_user)):
+        """Propose Anki cards from pasted content (no writes).
+
+        The caller verifies with checkboxes and creates the chosen ones via
+        POST /api/cards. Content is capped at GENERATE_MAX_CHARS.
+        """
+        try:
+            deck = Deck.objects(owner=user, id=body.deck_id).first()
+        except Exception:
+            deck = None
+        if deck is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Deck not found")
+        content = (body.content or "").strip()
+        if not content:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST, "Content must be non-empty"
+            )
+        if len(content) > ai_review.GENERATE_MAX_CHARS:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                f"Content must be at most {ai_review.GENERATE_MAX_CHARS} characters",
+            )
+        try:
+            suggestions, model = ai_review.propose_cards_from_text(content)
+        except RuntimeError as exc:
+            raise HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)
+            ) from exc
+        except ValueError as exc:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST, str(exc)
+            ) from exc
+        except Exception as exc:
+            raise HTTPException(
+                status.HTTP_502_BAD_GATEWAY, f"Card generation failed: {exc}"
+            ) from exc
+        return {"suggestions": suggestions, "model": model}
 
     @app.post("/api/chat")
     def deck_chat(body: ChatBody, user: User = Depends(get_current_user)):
@@ -973,7 +1264,7 @@ def create_app() -> FastAPI:
         state = CardState.objects(user=user, card=card).first()
         if state is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "No state for this card")
-        return _present_state(state)
+        return _present_state(state, fsrs_service.get_scheduler(user))
 
     @app.get("/api/cards/{card_id}/related")
     def related_cards(
@@ -1193,24 +1484,36 @@ def create_app() -> FastAPI:
             deck = Deck.objects(owner=user, id=deck_id).first()
             if deck is None:
                 raise HTTPException(status.HTTP_404_NOT_FOUND, "Deck not found")
-        cards = _active_cards(user, deck)
+        card_ids = _active_cards(user, deck)
+        scheduler = fsrs_service.get_scheduler(user)
         if exclude:
             # Lets the client preload the card after the current one: the
             # current card is still due (ungraded), so skip it explicitly.
-            cards = {cid: c for cid, c in cards.items() if str(cid) != exclude}
+            card_ids = [cid for cid in card_ids if str(cid) != exclude]
         out = []
+        now = utcnow()
         review_query: dict = {
             "user": user,
-            "card__in": list(cards),
+            "card__in": card_ids,
             "reps__gt": 0,
-            "due__lte": utcnow(),
+            "due__lte": now,
         }
         for s in CardState.objects(**review_query).order_by("due").limit(limit):
-            out.append(_present_state(s))
+            out.append(_present_state(s, scheduler))
         if len(out) < limit:
-            for s in _new_queue(user, cards, limit - len(out)):
-                out.append(_present_state(s))
-        return {"cards": out}
+            for s in _new_queue(user, card_ids, limit - len(out), deck):
+                out.append(_present_state(s, scheduler))
+        # Earliest future due: when the next card matures (intraday steps).
+        upcoming = (
+            CardState.objects(user=user, card__in=card_ids, due__gt=now)
+            .order_by("due")
+            .first()
+        )
+        next_due_at = None
+        if upcoming is not None and upcoming.due is not None:
+            # Mongo returns naive UTC; mark it so the client diffs correctly.
+            next_due_at = fsrs_service.ensure_aware(upcoming.due).isoformat()
+        return {"cards": out, "next_due_at": next_due_at}
 
     @app.post("/api/review/{card_id}")
     def review_card(
@@ -1225,9 +1528,12 @@ def create_app() -> FastAPI:
         if state is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "No state for this card")
         current = _scheduler_fields(state)
+        scheduler = fsrs_service.get_scheduler(user)
         now = utcnow()
         first_grading = state.reps == 0
-        updated = fsrs_service.apply_rating(current, body.rating, now)
+        updated = fsrs_service.apply_rating(
+            current, body.rating, now, scheduler=scheduler
+        )
         changes = {
             "state": updated["state"],
             "step": updated["step"],
@@ -1251,7 +1557,7 @@ def create_app() -> FastAPI:
             difficulty=updated["difficulty"],
         ).save()
         state.reload()
-        return _present_state(state)
+        return _present_state(state, scheduler)
 
     @app.get("/api/stats")
     def stats(user: User = Depends(get_current_user)):
@@ -1274,6 +1580,8 @@ def create_app() -> FastAPI:
         due = sum(1 for s in states if is_due(s))
         today_reviews = list(Review.objects(user=user, reviewed_at__gte=today))
         studied = len({r.card.id for r in today_reviews})
+        goal_target = user.daily_goal or 20
+        streak = reminders_service.streak_for_user(user, now, today)
         new_today = sum(
             1 for s in states if s.introduced_at and aware(s.introduced_at) >= today
         )
@@ -1300,6 +1608,19 @@ def create_app() -> FastAPI:
                 }
             )
         visible = [c for c in cards if not c.deleted]
+        year_ago = today - timedelta(days=364)
+        history_counts: dict[str, int] = {}
+        for r in Review.objects(user=user, reviewed_at__gte=year_ago).only(
+            "reviewed_at"
+        ):
+            if r.reviewed_at is None:
+                continue
+            day = aware(r.reviewed_at).date().isoformat()
+            history_counts[day] = history_counts.get(day, 0) + 1
+        review_history = [
+            {"date": d, "reviews": history_counts[d]}
+            for d in sorted(history_counts)
+        ]
         added_per_day = []
         for i in range(29, -1, -1):
             day = today - timedelta(days=i)
@@ -1330,9 +1651,175 @@ def create_app() -> FastAPI:
                 "reviews": len(today_reviews),
                 "accuracy": accuracy,
             },
+            "streak": streak,
+            "goal": {
+                "target": goal_target,
+                "studied": studied,
+                "met": studied >= goal_target,
+            },
             "forecast": forecast,
             "added_per_day": added_per_day,
+            "review_history": review_history,
+            "retention": _retention_table(user),
+            "workload": [
+                {
+                    "date": entry["date"],
+                    "due": entry["due"],
+                    "new": sum(
+                        _deck_new_limit(d) for d in Deck.objects(owner=user)
+                    ),
+                }
+                for entry in forecast
+            ],
         }
+
+    @app.get("/api/preferences")
+    def get_preferences(user: User = Depends(get_current_user)):
+        """The caller's study preferences (daily goal, email reminders)."""
+        return {
+            "daily_goal": user.daily_goal or 20,
+            "reminder_enabled": bool(user.reminder_enabled),
+        }
+
+    @app.put("/api/preferences")
+    def update_preferences(
+        body: PreferencesBody, user: User = Depends(get_current_user)
+    ):
+        """Update the caller's study preferences (partial)."""
+        updates = {}
+        if body.daily_goal is not None:
+            if not 1 <= body.daily_goal <= 1000:
+                raise HTTPException(
+                    status.HTTP_400_BAD_REQUEST,
+                    "daily_goal must be between 1 and 1000",
+                )
+            updates["daily_goal"] = body.daily_goal
+        if body.reminder_enabled is not None:
+            updates["reminder_enabled"] = bool(body.reminder_enabled)
+        if updates:
+            user.update(**{f"set__{k}": v for k, v in updates.items()})
+            user.reload()
+        return {
+            "daily_goal": user.daily_goal or 20,
+            "reminder_enabled": bool(user.reminder_enabled),
+        }
+
+    @app.get("/api/fsrs")
+    def fsrs_status(user: User = Depends(get_current_user)):
+        """Current scheduler weights: tuned or library defaults."""
+        from .models import SchedulerConfig
+
+        config = SchedulerConfig.objects(user=user).first()
+        review_count = Review.objects(user=user).count()
+        return {
+            "custom": config is not None,
+            "parameters": list(config.parameters) if config else list(fsrs_service.DEFAULT_PARAMETERS),
+            "default_parameters": list(fsrs_service.DEFAULT_PARAMETERS),
+            "review_count": review_count,
+            "reviews_used": config.reviews_used if config else 0,
+            "log_loss_before": config.log_loss_before if config else None,
+            "log_loss_after": config.log_loss_after if config else None,
+            "updated_at": config.updated_at.isoformat() if config and config.updated_at else None,
+            "learning_steps": list(config.learning_steps)
+            if config and config.learning_steps
+            else list(fsrs_service.DEFAULT_LEARNING_STEPS),
+            "relearning_steps": list(config.relearning_steps)
+            if config and config.relearning_steps
+            else list(fsrs_service.DEFAULT_RELEARNING_STEPS),
+        }
+
+    @app.put("/api/fsrs/settings")
+    def fsrs_settings(
+        body: FsrsSettingsBody, user: User = Depends(get_current_user)
+    ):
+        """Set learning/relearning steps in minutes (tuned weights kept)."""
+        if body.learning_steps is None and body.relearning_steps is None:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                "Provide learning_steps and/or relearning_steps",
+            )
+        current = fsrs_service.get_scheduler_steps(user)
+        try:
+            result = fsrs_service.set_scheduler_steps(
+                user,
+                body.learning_steps
+                if body.learning_steps is not None
+                else current["learning_steps"],
+                body.relearning_steps
+                if body.relearning_steps is not None
+                else current["relearning_steps"],
+            )
+        except ValueError as exc:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+        return result
+
+    @app.post("/api/fsrs/optimize")
+    def fsrs_optimize(user: User = Depends(get_current_user)):
+        """Tune the user's FSRS weights on their own review history.
+
+        Runs synchronously; larger histories take a few seconds.
+        """
+        try:
+            result = fsrs_service.optimize_parameters(user)
+        except ValueError as exc:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(
+                status.HTTP_502_BAD_GATEWAY, f"Optimization failed: {exc}"
+            ) from exc
+        return result
+
+    @app.post("/api/fsrs/reset")
+    def fsrs_reset(user: User = Depends(get_current_user)):
+        """Forget tuned weights; return to library defaults."""
+        fsrs_service.reset_parameters(user)
+        return {"reset": True}
+
+    @app.post("/api/fsrs/reschedule")
+    def fsrs_reschedule(user: User = Depends(get_current_user)):
+        """Replay every reviewed card's history through the current scheduler.
+
+        Updates stability, difficulty, and due dates; reps, lapses, and
+        introduction dates are kept.
+        """
+        scheduler = fsrs_service.get_scheduler(user)
+        rescheduled = 0
+        for state in CardState.objects(user=user, reps__gt=0):
+            reviews = [
+                (r.rating, r.reviewed_at)
+                for r in Review.objects(user=user, card=state.card).order_by(
+                    "reviewed_at"
+                )
+                if r.reviewed_at is not None
+            ]
+            if not reviews:
+                continue
+            fields = fsrs_service.reschedule_fields(
+                _scheduler_fields(state), reviews, scheduler
+            )
+            state.update(
+                state=fields["state"],
+                step=fields["step"],
+                stability=fields["stability"],
+                difficulty=fields["difficulty"],
+                due=fields["due"],
+                last_review=fields["last_review"],
+            )
+            rescheduled += 1
+        return {"rescheduled": rescheduled}
+
+    @app.get("/api/today")
+    def today_progress(user: User = Depends(get_current_user)):
+        """Distinct cards studied today (lightweight review-header count)."""
+        studied = len(
+            {
+                r.card.id
+                for r in Review.objects(
+                    user=user, reviewed_at__gte=_day_start()
+                ).only("card")
+            }
+        )
+        return {"studied": studied}
 
     @app.get("/api/build-info")
     def build_info(user: User = Depends(get_current_user)):
@@ -1619,6 +2106,47 @@ def _day_start() -> datetime:
     return utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
 
 
+def _retention_table(user: User) -> list[dict]:
+    """True retention by interval bucket (Anki-style young/mature split).
+
+    Interval is the assigned gap (next_due - reviewed_at): under a day is
+    still learning, 1-20 days is young, 21+ days is mature. A grade above
+    Again counts as recalled.
+    """
+    buckets: dict[str, dict[str, int]] = {
+        "learning": {"reviews": 0, "correct": 0},
+        "young": {"reviews": 0, "correct": 0},
+        "mature": {"reviews": 0, "correct": 0},
+    }
+    for review in Review.objects(user=user).only(
+        "rating", "reviewed_at", "next_due"
+    ):
+        if review.reviewed_at is None or review.next_due is None:
+            continue
+        interval_days = (
+            fsrs_service.ensure_aware(review.next_due)
+            - fsrs_service.ensure_aware(review.reviewed_at)
+        ).days
+        bucket = (
+            "learning" if interval_days < 1 else "young" if interval_days < 21 else "mature"
+        )
+        buckets[bucket]["reviews"] += 1
+        if (review.rating or 1) > 1:
+            buckets[bucket]["correct"] += 1
+    table = []
+    for bucket, counts in buckets.items():
+        reviews, correct = counts["reviews"], counts["correct"]
+        table.append(
+            {
+                "bucket": bucket,
+                "reviews": reviews,
+                "correct": correct,
+                "rate": round(100 * correct / reviews, 1) if reviews else None,
+            }
+        )
+    return table
+
+
 def _copy_database(source, target, names: list[str]) -> dict[str, int]:
     """Replace target's collections with source's documents.
 
@@ -1692,36 +2220,92 @@ def _export_apkg(decks, out_path: str) -> None:
         shutil.rmtree(workdir, ignore_errors=True)
 
 
-def _active_cards(user: User, deck: Deck | None) -> dict:
-    """Active (non-suspended, non-deleted) cards by id, scoped to one deck."""
+def _active_cards(user: User, deck: Deck | None) -> list:
+    """Active (non-suspended, non-deleted) card ids, scoped to one deck.
+
+    Ids only: full Card documents carry HTML and embedding vectors, which
+    dwarf what the review queue needs to pick the next card.
+    """
     if deck is not None:
-        found = Card.objects(deck=deck, suspended=False, deleted__ne=True)
+        query = Card.objects(deck=deck, suspended=False, deleted__ne=True)
     else:
         deck_ids = [d.id for d in Deck.objects(owner=user)]
-        found = (
+        query = (
             Card.objects(deck__in=deck_ids, suspended=False, deleted__ne=True)
             if deck_ids
-            else []
+            else None
         )
-    return {c.id: c for c in found}
+    return list(query.values_list("id")) if query is not None else []
 
 
-def _new_budget(user: User) -> int:
-    introduced_today = CardState.objects(
-        user=user, introduced_at__gte=_day_start()
-    ).count()
-    return max(0, fsrs_service.NEW_CARDS_PER_DAY - introduced_today)
+def _deck_new_limit(deck: Deck) -> int:
+    """Effective daily new-card budget for one deck (override or default)."""
+    if deck.new_cards_per_day:
+        return deck.new_cards_per_day
+    return fsrs_service.NEW_CARDS_PER_DAY
 
 
-def _new_queue(user: User, cards: dict, count: int) -> list[CardState]:
-    """Unseen cards in Anki new-order, capped by the remaining daily budget."""
-    budget = _new_budget(user)
+def _deck_new_order(deck: Deck) -> str:
+    if (deck.new_order or "") == "newest":
+        return "newest"
+    return "position"
+
+
+def _new_budget(user: User, deck: Deck | None = None) -> int:
+    """Remaining daily new-card budget: per-deck, or summed across decks."""
+    day_start = _day_start()
+    if deck is not None:
+        card_ids = list(
+            Card.objects(deck=deck, deleted__ne=True).values_list("id")
+        )
+        introduced = (
+            CardState.objects(
+                user=user, card__in=card_ids, introduced_at__gte=day_start
+            ).count()
+            if card_ids
+            else 0
+        )
+        return max(0, _deck_new_limit(deck) - introduced)
+    total = 0
+    for other in Deck.objects(owner=user):
+        total += _new_budget(user, other)
+    return total
+
+
+def _new_queue(
+    user: User, cards: dict, count: int, deck: Deck | None = None
+) -> list[CardState]:
+    """Unseen cards capped by the remaining daily budget.
+
+    Deck position order is the default; a deck set to "newest" serves the
+    most recently created cards first.
+    """
+    budget = _new_budget(user, deck)
     if count <= 0 or budget <= 0 or not cards:
         return []
+    take = min(count, budget)
+    if deck is not None and _deck_new_order(deck) == "newest":
+        states = list(
+            CardState.objects(
+                user=user, card__in=list(cards), reps=0, due__lte=utcnow()
+            ).limit(5000)
+        )
+        created = {
+            c.id: fsrs_service.ensure_aware(c.created_at)
+            for c in Card.objects(id__in=[s.card.id for s in states]).only(
+                "created_at"
+            )
+        }
+        fallback = datetime.min.replace(tzinfo=UTC)
+        states.sort(
+            key=lambda s: created.get(s.card.id) or fallback,
+            reverse=True,
+        )
+        return states[:take]
     return list(
         CardState.objects(user=user, card__in=list(cards), reps=0, due__lte=utcnow())
         .order_by("new_position", "id")
-        .limit(min(count, budget))
+        .limit(take)
     )
 
 
@@ -1785,11 +2369,11 @@ def _paged_states(
 
 
 def _review_due_count(user: User) -> int:
-    cards = _active_cards(user, None)
-    if not cards:
+    card_ids = _active_cards(user, None)
+    if not card_ids:
         return 0
     return CardState.objects(
-        user=user, card__in=list(cards), reps__gt=0, due__lte=utcnow()
+        user=user, card__in=card_ids, reps__gt=0, due__lte=utcnow()
     ).count()
 
 
@@ -1859,21 +2443,23 @@ def _scheduler_fields(state: CardState) -> dict:
     }
 
 
-def _preview_intervals(state: CardState, now: datetime) -> dict:
+def _preview_intervals(
+    state: CardState, now: datetime, scheduler=None
+) -> dict:
     """Next-due preview per rating, so the UI can label the grade buttons."""
     current = _scheduler_fields(state)
     previews = {}
     for rating in (1, 2, 3, 4):
         try:
             previews[str(rating)] = fsrs_service.apply_rating(
-                current, rating, now
+                current, rating, now, scheduler=scheduler
             )["due"].isoformat()
         except Exception:
             continue
     return previews
 
 
-def _present_state(state: CardState) -> dict:
+def _present_state(state: CardState, scheduler=None) -> dict:
     """Review payload: card HTML plus full scheduling/metadata for debugging."""
     card = state.card
     return {
@@ -1882,11 +2468,12 @@ def _present_state(state: CardState) -> dict:
         "deck_name": card.deck.name,
         "front_html": card.front_html,
         "back_html": strip_front_echo(card.front_html, card.back_html),
+        "tags": list(card.tags or []),
         "due": state.due.isoformat(),
         "state": state.state,
         "reps": state.reps,
         "created_at": card.created_at.isoformat() if card.created_at else None,
-        "intervals": _preview_intervals(state, utcnow()),
+        "intervals": _preview_intervals(state, utcnow(), scheduler),
         "meta": {
             "card_id": str(card.id),
             "deck_id": str(card.deck.id),

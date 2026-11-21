@@ -105,12 +105,33 @@ export interface Deck {
   due: number;
   due_today: number;
   new: number;
+  new_cards_per_day: number | null;
+  new_order: string;
+  new_limit: number;
+  new_due: number;
 }
 
 export async function getDecks(): Promise<Deck[]> {
   const res = await apiFetch('/decks');
   const data = await readJson(res);
   return data.decks ?? [];
+}
+
+export interface DeckSettings {
+  new_cards_per_day?: number | null;
+  new_order?: string;
+}
+
+/** Update a deck's new-card budget (0 resets to default) and gather order. */
+export async function updateDeckSettings(
+  deckId: string,
+  settings: { new_cards_per_day?: number; new_order?: string },
+): Promise<DeckSettings & { id: string; name: string; new_limit: number }> {
+  const res = await apiFetch(`/decks/${encodeURIComponent(deckId)}`, {
+    method: 'PUT',
+    body: JSON.stringify(settings),
+  });
+  return readJson(res);
 }
 
 export interface CardMeta {
@@ -146,21 +167,28 @@ export interface ReviewCard {
   state: string;
   reps: number;
   created_at?: string | null;
+  tags?: string[];
   /** Next-due ISO timestamps per rating ("1".."4"), for button labels. */
   intervals?: Record<string, string>;
   /** Full card + scheduling metadata for troubleshooting. */
   meta?: CardMeta | null;
 }
 
+export interface NextQueue {
+  cards: ReviewCard[];
+  /** Earliest future due (UTC ISO): when the next card matures. */
+  next_due_at: string | null;
+}
+
 export async function getNext(
   deckId: string | '',
   excludeId?: string,
-): Promise<ReviewCard[]> {
+): Promise<NextQueue> {
   const q = deckId ? `?deck_id=${encodeURIComponent(deckId)}&limit=1` : '?limit=1';
   const ex = excludeId ? `&exclude=${encodeURIComponent(excludeId)}` : '';
   const res = await apiFetch(`/next${q}${ex}`);
   const data = await readJson(res);
-  return data.cards ?? [];
+  return { cards: data.cards ?? [], next_due_at: data.next_due_at ?? null };
 }
 
 export async function gradeCard(cardId: string, rating: number): Promise<ReviewCard> {
@@ -338,6 +366,25 @@ export async function restoreCard(cardId: string): Promise<void> {
   await readJson(res);
 }
 
+export interface DuplicateCard {
+  card_id: string;
+  front_text: string;
+  kind: 'exact' | 'similar';
+  score: number | null;
+}
+
+/** Existing cards near-identical to a prospective new one (non-blocking). */
+export async function checkDuplicates(
+  deckId: string,
+  front: string,
+  back: string,
+): Promise<DuplicateCard[]> {
+  let q = `?front=${encodeURIComponent(front)}&back=${encodeURIComponent(back)}`;
+  const res = await apiFetch(`/decks/${encodeURIComponent(deckId)}/duplicates${q}`);
+  const data = await readJson(res);
+  return data.duplicates ?? [];
+}
+
 export interface UpdatedCard {
   card_id: string;
   deck_id: string;
@@ -391,6 +438,7 @@ export interface BrowseCard {
   created_via_mcp?: boolean;
   /** True when the card counts as due today (drives the divider line). */
   due_today: boolean;
+  tags?: string[];
 }
 
 export const BROWSE_PAGE = 50;
@@ -405,6 +453,7 @@ export async function browseCards(
   showDeleted = false,
   mcpOnly = false,
   suspendedOnly = false,
+  tag?: string,
 ): Promise<{ cards: BrowseCard[]; total: number }> {
   let q =
     `?sort=${sort}&direction=${direction}&skip=${skip}&limit=${limit}`;
@@ -412,7 +461,33 @@ export async function browseCards(
   if (showDeleted) q += '&show_deleted=true';
   if (mcpOnly) q += '&mcp_only=true';
   if (suspendedOnly) q += '&suspended_only=true';
+  if (tag) q += `&tag=${encodeURIComponent(tag)}`;
   const res = await apiFetch(`/decks/${encodeURIComponent(deckId)}/cards${q}`);
+  return readJson(res);
+}
+
+/** Replace a card's tags (lowercased, deduped server-side). */
+export async function setCardTags(
+  cardId: string,
+  tags: string[],
+): Promise<{ card_id: string; tags: string[] }> {
+  const res = await apiFetch(`/cards/${encodeURIComponent(cardId)}/tags`, {
+    method: 'PATCH',
+    body: JSON.stringify({ tags }),
+  });
+  return readJson(res);
+}
+
+/** Add and/or remove tags on many cards at once. */
+export async function bulkTagCards(
+  cardIds: string[],
+  add: string[],
+  remove: string[],
+): Promise<{ updated: number }> {
+  const res = await apiFetch('/cards/bulk-tags', {
+    method: 'POST',
+    body: JSON.stringify({ card_ids: cardIds, add, remove }),
+  });
   return readJson(res);
 }
 
@@ -482,6 +557,18 @@ export async function chatDeck(
       ...(deckIds && deckIds.length > 0 ? { deck_ids: deckIds } : {}),
       ...(history && history.length > 0 ? { history } : {}),
     }),
+  });
+  return readJson(res);
+}
+
+/** Propose Anki cards from pasted content (no writes; verify before creating). */
+export async function generateCards(
+  deckId: string,
+  content: string,
+): Promise<{ suggestions: AiSuggestion[]; model: string }> {
+  const res = await apiFetch('/cards/generate', {
+    method: 'POST',
+    body: JSON.stringify({ deck_id: deckId, content }),
   });
   return readJson(res);
 }
@@ -610,12 +697,32 @@ export interface Stats {
     reviews: number;
     accuracy: number | null;
   };
+  streak?: number;
+  goal?: {
+    target: number;
+    studied: number;
+    met: boolean;
+  };
+  retention?: Array<{
+    bucket: string;
+    reviews: number;
+    correct: number;
+    rate: number | null;
+  }>;
+  workload?: Array<{ date: string; due: number; new: number }>;
   forecast: Array<{ date: string; due: number }>;
   added_per_day?: Array<{ date: string; added: number }>;
+  review_history?: Array<{ date: string; reviews: number }>;
 }
 
 export async function getStats(): Promise<Stats> {
   const res = await apiFetch('/stats');
+  return readJson(res);
+}
+
+/** Distinct cards studied today (lightweight review-header count). */
+export async function getToday(): Promise<{ studied: number }> {
+  const res = await apiFetch('/today');
   return readJson(res);
 }
 
@@ -753,6 +860,93 @@ export async function exportFeedback(filter?: FeedbackFilter): Promise<void> {
   a.click();
   a.remove();
   setTimeout(() => URL.revokeObjectURL(url), 5000);
+}
+
+export interface Preferences {
+  daily_goal: number;
+  reminder_enabled: boolean;
+}
+
+/** The caller's study preferences (daily goal, email reminders). */
+export async function getPreferences(): Promise<Preferences> {
+  const res = await apiFetch('/preferences');
+  return readJson(res);
+}
+
+/** Update study preferences (partial). */
+export async function updatePreferences(
+  prefs: Partial<Preferences>,
+): Promise<Preferences> {
+  const res = await apiFetch('/preferences', {
+    method: 'PUT',
+    body: JSON.stringify(prefs),
+  });
+  return readJson(res);
+}
+
+export interface FsrsStatus {
+  custom: boolean;
+  parameters: number[];
+  default_parameters: number[];
+  review_count: number;
+  reviews_used: number;
+  log_loss_before: number | null;
+  log_loss_after: number | null;
+  updated_at: string | null;
+  learning_steps: number[];
+  relearning_steps: number[];
+}
+
+/** Set learning/relearning steps in minutes (tuned weights kept). */
+export async function updateFsrsSettings(settings: {
+  learning_steps?: number[];
+  relearning_steps?: number[];
+}): Promise<{ learning_steps: number[]; relearning_steps: number[] }> {
+  const res = await apiFetch('/fsrs/settings', {
+    method: 'PUT',
+    body: JSON.stringify(settings),
+  });
+  return readJson(res);
+}
+
+export interface FsrsOptimizeResult {
+  parameters: number[];
+  log_loss_before: number;
+  log_loss_after: number;
+  reviews_used: number;
+}
+
+/** Current scheduler weights: tuned or library defaults. */
+export async function getFsrsStatus(): Promise<FsrsStatus> {
+  const res = await apiFetch('/fsrs');
+  return readJson(res);
+}
+
+/** Tune FSRS weights on the caller's review history. */
+export async function optimizeFsrs(): Promise<FsrsOptimizeResult> {
+  const res = await apiFetch('/fsrs/optimize', {
+    method: 'POST',
+    body: JSON.stringify({}),
+  });
+  return readJson(res);
+}
+
+/** Forget tuned weights; return to library defaults. */
+export async function resetFsrs(): Promise<{ reset: boolean }> {
+  const res = await apiFetch('/fsrs/reset', {
+    method: 'POST',
+    body: JSON.stringify({}),
+  });
+  return readJson(res);
+}
+
+/** Replay every reviewed card's history through the current scheduler. */
+export async function rescheduleFsrs(): Promise<{ rescheduled: number }> {
+  const res = await apiFetch('/fsrs/reschedule', {
+    method: 'POST',
+    body: JSON.stringify({}),
+  });
+  return readJson(res);
 }
 
 export interface BuildInfo {

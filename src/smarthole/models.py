@@ -63,6 +63,8 @@ class User(Document):
     picture = StringField()
     google_sub = StringField()
     created_at = DateTimeField(default=utcnow)
+    daily_goal = IntField(default=20, min_value=1, max_value=1000)
+    reminder_enabled = BooleanField(default=False)
 
 
 class Session(Document):
@@ -83,6 +85,10 @@ class Deck(Document):
     name = StringField(required=True)
     source_apkg = StringField()
     created_at = DateTimeField(default=utcnow)
+    # Per-deck new-card budget (None = global NEW_CARDS_PER_DAY default).
+    new_cards_per_day = IntField()
+    # New-card gather order: Anki position order, or newest-created first.
+    new_order = StringField(default="position")
 
 
 class Card(Document):
@@ -96,6 +102,8 @@ class Card(Document):
             ("deck", "deleted"),
             # Browse filter for MCP-created cards.
             ("deck", "created_via_mcp"),
+            # Browse filter for tags.
+            ("deck", "tags"),
         ],
     }
 
@@ -107,6 +115,7 @@ class Card(Document):
     anki_nid = IntField()
     anki_ord = IntField()
     anki_guid = StringField()
+    tags = ListField(StringField(), default=list)
     suspended = BooleanField(default=False)
     new_position = IntField(default=0)  # Anki new-queue order
     created_at = DateTimeField(default=utcnow)
@@ -175,6 +184,25 @@ class Review(Document):
     next_due = DateTimeField(required=True)
     stability = FloatField()
     difficulty = FloatField()
+
+
+class SchedulerConfig(Document):
+    """Per-user FSRS weights tuned on that user's review history.
+
+    Absent means the library defaults (see fsrs_service.DEFAULT_PARAMETERS).
+    """
+
+    meta = {"collection": "scheduler_configs", "indexes": ["user"]}
+
+    user = ReferenceField(User, required=True, unique=True)
+    parameters = ListField(FloatField(), required=True)
+    reviews_used = IntField(default=0)
+    log_loss_before = FloatField()
+    log_loss_after = FloatField()
+    updated_at = DateTimeField(default=utcnow)
+    # Learning/relearning steps in minutes (defaults mirror the Scheduler).
+    learning_steps = ListField(IntField(), default=[1, 10])
+    relearning_steps = ListField(IntField(), default=[10])
 
 
 class Media(Document):

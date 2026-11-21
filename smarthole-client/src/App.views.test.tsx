@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { expect, test, vi } from 'vitest';
 import App from './App';
 import { htmlToText } from './api';
@@ -22,7 +22,8 @@ function mockApi() {
         return body({
           decks: [{ id: 'd1', name: 'Test', total: 10, due: 3, due_today: 5, new: 2 }],
         });
-      if (u.startsWith('/api/next')) return body({ cards: [] });
+      if (u.startsWith('/api/next')) return body({ cards: [], next_due_at: null });
+      if (u === '/api/today') return body({ studied: 4 });
       if (u === '/api/stats')
         return body({
           totals: { cards: 10, new: 3, learning: 1, review: 5, suspended: 1, due: 2 },
@@ -833,44 +834,52 @@ test('related card link queues it next after grading', async () => {
     state: 2,
     reps: 1,
   };
-  vi.stubGlobal(
-    'fetch',
-    vi.fn(async (url: any, init?: any) => {
-      const u = String(url);
-      const body = (v: any) => ({ ok: true, json: () => Promise.resolve(v) });
-      if (u === '/api/config') return body({ googleClientId: null });
-      if (u === '/api/me') return body({ email: 't@example.com' });
-      if (u === '/api/decks')
-        return body({
-          decks: [{ id: 'd1', name: 'Test', total: 10, due: 3, due_today: 5, new: 2 }],
-        });
-      if (u.startsWith('/api/next')) {
-        // Initial load and prefetch: only the first call has no exclude.
-        if (u.includes('exclude')) return body({ cards: [] });
-        return body({ cards: [c1] });
-      }
-      if (u.startsWith('/api/cards/c1/related'))
-        return body({
-          cards: [{ card_id: 'c2', front_text: 'Q2', deck_name: 'Test', score: 0.9 }],
-          unavailable: false,
-        });
-      if (u.startsWith('/api/cards/c2/related'))
-        return body({ cards: [], unavailable: true });
-      if (u === '/api/cards/c2' && init?.method !== 'DELETE') return body(c2);
-      if (u === '/api/review/c1' && init?.method === 'POST') return body(c1);
-      throw new Error(`unexpected fetch ${u} ${init?.method ?? 'GET'}`);
-    }),
-  );
+  const fetchMock = vi.fn(async (url: any, init?: any) => {
+    const u = String(url);
+    const body = (v: any) => ({ ok: true, json: () => Promise.resolve(v) });
+    if (u === '/api/config') return body({ googleClientId: null });
+    if (u === '/api/me') return body({ email: 't@example.com' });
+    if (u === '/api/decks')
+      return body({
+        decks: [{ id: 'd1', name: 'Test', total: 10, due: 3, due_today: 5, new: 2 }],
+      });
+    if (u.startsWith('/api/next')) {
+      // Initial load and prefetch: only the first call has no exclude.
+      if (u.includes('exclude')) return body({ cards: [] });
+      return body({ cards: [c1] });
+    }
+    if (u.startsWith('/api/cards/c1/related'))
+      return body({
+        cards: [{ card_id: 'c2', front_text: 'Q2', deck_name: 'Test', score: 0.9 }],
+        unavailable: false,
+      });
+    if (u.startsWith('/api/cards/c2/related'))
+      return body({ cards: [], unavailable: true });
+    if (u === '/api/cards/c2' && init?.method !== 'DELETE') return body(c2);
+    if (u === '/api/review/c1' && init?.method === 'POST') return body(c1);
+    throw new Error(`unexpected fetch ${u} ${init?.method ?? 'GET'}`);
+  });
+  vi.stubGlobal('fetch', fetchMock);
   render(<App />);
-  // The related hint shows the closest card as a title link.
+  // The related hint stays hidden while only the question is shown, even
+  // once its data has loaded.
+  await waitFor(() => expect(screen.getByRole('button', { name: 'Show answer' })).toBeTruthy());
+  await waitFor(() =>
+    expect(
+      fetchMock.mock.calls.some(([u]) => String(u).startsWith('/api/cards/c1/related')),
+    ).toBe(true),
+  );
+  expect(screen.queryByTestId('related-hint')).toBeNull();
+  // After the answer is shown, the hint shows the closest card as a title link.
+  fireEvent.click(screen.getByRole('button', { name: 'Show answer' }));
   await waitFor(() => expect(screen.getByTestId('related-hint')).toBeTruthy());
   expect(screen.getByTestId('related-hint')).toHaveTextContent('Q2');
   // Clicking it queues the related card instead of navigating away.
   fireEvent.click(screen.getByText('Q2'));
   await waitFor(() => expect(screen.getByTestId('queued-next')).toBeTruthy());
   expect(screen.getByTestId('queued-next')).toHaveTextContent('Q2');
-  // Grading the current card shows the queued card next.
-  fireEvent.click(screen.getByRole('button', { name: 'Show answer' }));
+  // Grading the current card shows the queued card next (the answer is
+  // already shown from revealing the hint above).
   fireEvent.click(screen.getByRole('button', { name: 'Good' }));
   await waitFor(() => expect(screen.getByText('Q2', { selector: 'div' })).toBeTruthy());
   expect(screen.queryByTestId('queued-next')).toBeNull();
@@ -1498,4 +1507,586 @@ test('deck chat sends the question and shows the answer with cited cards', async
   );
   expect(screen.getByText('Bio: Mitochondria')).toBeTruthy();
   vi.unstubAllGlobals();
+});
+
+test('stats view shows the review activity heatmap', async () => {
+  const todayIso = new Date().toISOString().slice(0, 10);
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (url: any) => {
+      const u = String(url);
+      const body = (v: any) => ({ ok: true, json: () => Promise.resolve(v) });
+      if (u === '/api/config') return body({ googleClientId: null });
+      if (u === '/api/me') return body({ email: 't@example.com' });
+      if (u === '/api/decks')
+        return body({
+          decks: [{ id: 'd1', name: 'Test', total: 10, due: 3, due_today: 5, new: 2 }],
+        });
+      if (u.startsWith('/api/next')) return body({ cards: [] });
+      if (u === '/api/stats')
+        return body({
+          totals: { cards: 10, new: 3, learning: 1, review: 5, suspended: 1, due: 2 },
+          today: { studied: 4, new: 1, reviews: 5, accuracy: 80.0 },
+          forecast: [{ date: '2026-11-08', due: 2 }],
+          review_history: [{ date: todayIso, reviews: 2 }],
+        });
+      if (u === '/api/build-info')
+        return body({ server_started_at: '2026-11-12T14:05:00+00:00', server_git_sha: null });
+      throw new Error(`unexpected fetch ${u}`);
+    }),
+  );
+  render(<App />);
+  await waitFor(() => expect(screen.getByLabelText('menu')).toBeTruthy());
+  fireEvent.click(screen.getByLabelText('menu'));
+  fireEvent.click(screen.getByText('Stats'));
+  await waitFor(() => expect(screen.getByTestId('review-heatmap')).toBeTruthy());
+  expect(
+    within(screen.getByTestId('review-heatmap')).getByTitle(/2 reviews/),
+  ).toBeTruthy();
+  vi.unstubAllGlobals();
+});
+
+test('add view warns about near-duplicates while typing', async () => {
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (url: any) => {
+      const u = String(url);
+      const body = (v: any) => ({ ok: true, json: () => Promise.resolve(v) });
+      if (u === '/api/config') return body({ googleClientId: null });
+      if (u === '/api/me') return body({ email: 't@example.com' });
+      if (u === '/api/decks')
+        return body({
+          decks: [{ id: 'd1', name: 'Test', total: 10, due: 3, due_today: 5, new: 2 }],
+        });
+      if (u.startsWith('/api/next')) return body({ cards: [] });
+      if (u.startsWith('/api/decks/d1/duplicates')) {
+        if (u.includes('front=Mito')) {
+          return body({
+            duplicates: [
+              { card_id: 'c9', front_text: 'Mitochondria', kind: 'exact', score: null },
+            ],
+          });
+        }
+        return body({ duplicates: [] });
+      }
+      throw new Error(`unexpected fetch ${u}`);
+    }),
+  );
+  render(<App />);
+  await waitFor(() => expect(screen.getByLabelText('menu')).toBeTruthy());
+  fireEvent.click(screen.getByLabelText('menu'));
+  fireEvent.click(screen.getAllByText('Add new card')[0]);
+  await waitFor(() => expect(screen.getByLabelText('Question')).toBeTruthy());
+  fireEvent.change(screen.getByLabelText('Question'), { target: { value: 'Mito' } });
+  await waitFor(() =>
+    expect(screen.getByText(/Possible duplicate of 1 existing card/)).toBeTruthy(),
+  );
+  expect(screen.getByText(/Mitochondria/)).toBeTruthy();
+  vi.unstubAllGlobals();
+});
+
+test('generate page proposes cards and adds only the ticked ones', async () => {
+  const created: any[] = [];
+  const fetchMock = vi.fn(async (url: any, init?: any) => {
+    const u = String(url);
+    const body = (v: any) => ({ ok: true, json: () => Promise.resolve(v) });
+    if (u === '/api/config') return body({ googleClientId: null });
+    if (u === '/api/me') return body({ email: 't@example.com' });
+    if (u === '/api/decks')
+      return body({
+        decks: [{ id: 'd1', name: 'Test', total: 0, due: 0, due_today: 0, new: 0 }],
+      });
+    if (u.startsWith('/api/next')) return body({ cards: [] });
+    if (u === '/api/cards/generate' && init?.method === 'POST') {
+      return body({
+        suggestions: [
+          { front: 'Q1', back: 'A1' },
+          { front: 'Q2', back: 'A2' },
+        ],
+        model: 'test-model',
+      });
+    }
+    if (u === '/api/cards' && init?.method === 'POST') {
+      created.push(JSON.parse(init.body));
+      return { ok: true, status: 201, json: () => Promise.resolve({}) };
+    }
+    throw new Error(`unexpected fetch ${u} ${init?.method ?? 'GET'}`);
+  });
+  vi.stubGlobal('fetch', fetchMock);
+  render(<App />);
+  await waitFor(() => expect(screen.getByLabelText('menu')).toBeTruthy());
+  fireEvent.click(screen.getByLabelText('menu'));
+  fireEvent.click(screen.getAllByText('Generate cards')[0]);
+  await waitFor(() => expect(screen.getByLabelText('Paste content')).toBeTruthy());
+  fireEvent.change(screen.getByLabelText('Paste content'), {
+    target: { value: 'Some study content' },
+  });
+  fireEvent.click(screen.getByRole('button', { name: 'Propose cards' }));
+  await waitFor(() => expect(screen.getByText('Q1')).toBeTruthy());
+  expect(screen.getByText('Q2')).toBeTruthy();
+  // Untick the second proposal: only the first is created.
+  fireEvent.click(screen.getByLabelText('Keep proposal 2'));
+  fireEvent.click(screen.getByRole('button', { name: 'Add 1 selected' }));
+  await waitFor(() => expect(screen.getByText('1 card added.')).toBeTruthy());
+  expect(created).toHaveLength(1);
+  expect(created[0].front).toBe('Q1');
+  vi.unstubAllGlobals();
+});
+
+test('stats view shows streak, goal progress, and saves preferences', async () => {
+  const puts: any[] = [];
+  const fetchMock = vi.fn(async (url: any, init?: any) => {
+    const u = String(url);
+    const body = (v: any) => ({ ok: true, json: () => Promise.resolve(v) });
+    if (u === '/api/config') return body({ googleClientId: null });
+    if (u === '/api/me') return body({ email: 't@example.com' });
+    if (u === '/api/decks')
+      return body({
+        decks: [{ id: 'd1', name: 'Test', total: 10, due: 3, due_today: 5, new: 2 }],
+      });
+    if (u.startsWith('/api/next')) return body({ cards: [] });
+    if (u === '/api/stats')
+      return body({
+        totals: { cards: 10, new: 3, learning: 1, review: 5, suspended: 1, due: 2 },
+        today: { studied: 4, new: 1, reviews: 5, accuracy: 80.0 },
+        forecast: [{ date: '2026-11-08', due: 2 }],
+        streak: 6,
+        goal: { target: 20, studied: 4, met: false },
+      });
+    if (u === '/api/preferences' && (!init?.method || init.method === 'GET'))
+      return body({ daily_goal: 20, reminder_enabled: false });
+    if (u === '/api/preferences' && init?.method === 'PUT') {
+      const payload = JSON.parse(init.body);
+      puts.push(payload);
+      return body({ daily_goal: payload.daily_goal ?? 20, reminder_enabled: true });
+    }
+    if (u === '/api/build-info')
+      return body({ server_started_at: '2026-11-12T14:05:00+00:00', server_git_sha: null });
+    throw new Error(`unexpected fetch ${u} ${init?.method ?? 'GET'}`);
+  });
+  vi.stubGlobal('fetch', fetchMock);
+  render(<App />);
+  await waitFor(() => expect(screen.getByLabelText('menu')).toBeTruthy());
+  fireEvent.click(screen.getByLabelText('menu'));
+  fireEvent.click(screen.getByText('Stats'));
+  await waitFor(() => expect(screen.getByText('Day streak')).toBeTruthy());
+  expect(screen.getByTestId('daily-goal')).toHaveTextContent('4/20');
+  fireEvent.change(screen.getByLabelText('Daily goal (cards)'), {
+    target: { value: '30' },
+  });
+  fireEvent.click(screen.getByRole('button', { name: 'Save goal' }));
+  await waitFor(() =>
+    expect(puts.some((p) => p.daily_goal === 30)).toBe(true),
+  );
+  vi.unstubAllGlobals();
+});
+
+test('stats scheduler section optimizes and reports log-loss', async () => {
+  let tuned = false;
+  const fetchMock = vi.fn(async (url: any, init?: any) => {
+    const u = String(url);
+    const body = (v: any) => ({ ok: true, json: () => Promise.resolve(v) });
+    if (u === '/api/config') return body({ googleClientId: null });
+    if (u === '/api/me') return body({ email: 't@example.com' });
+    if (u === '/api/decks')
+      return body({
+        decks: [{ id: 'd1', name: 'Test', total: 10, due: 3, due_today: 5, new: 2 }],
+      });
+    if (u.startsWith('/api/next')) return body({ cards: [] });
+    if (u === '/api/stats')
+      return body({
+        totals: { cards: 10, new: 3, learning: 1, review: 5, suspended: 1, due: 2 },
+        today: { studied: 4, new: 1, reviews: 5, accuracy: 80.0 },
+        forecast: [{ date: '2026-11-08', due: 2 }],
+      });
+    if (u === '/api/preferences') return body({ daily_goal: 20, reminder_enabled: false });
+    if (u === '/api/fsrs')
+      return body({
+        custom: tuned,
+        parameters: Array(21).fill(0.5),
+        default_parameters: Array(21).fill(0.5),
+        review_count: 60,
+        reviews_used: tuned ? 57 : 0,
+        log_loss_before: null,
+        log_loss_after: null,
+        updated_at: null,
+      });
+    if (u === '/api/fsrs/optimize' && init?.method === 'POST') {
+      tuned = true;
+      return body({
+        parameters: Array(21).fill(0.5),
+        log_loss_before: 0.7,
+        log_loss_after: 0.6,
+        reviews_used: 57,
+      });
+    }
+    if (u === '/api/build-info')
+      return body({ server_started_at: '2026-11-12T14:05:00+00:00', server_git_sha: null });
+    throw new Error(`unexpected fetch ${u} ${init?.method ?? 'GET'}`);
+  });
+  vi.stubGlobal('fetch', fetchMock);
+  render(<App />);
+  await waitFor(() => expect(screen.getByLabelText('menu')).toBeTruthy());
+  fireEvent.click(screen.getByLabelText('menu'));
+  fireEvent.click(screen.getByText('Stats'));
+  await waitFor(() => expect(screen.getByTestId('fsrs-status')).toBeTruthy());
+  expect(screen.getByTestId('fsrs-status')).toHaveTextContent('Library defaults');
+  fireEvent.click(screen.getByRole('button', { name: 'Optimize on my reviews' }));
+  await waitFor(() =>
+    expect(screen.getByText(/Tuned on 57 reviews/)).toBeTruthy(),
+  );
+  expect(screen.getByTestId('fsrs-status')).toHaveTextContent('Tuned weights');
+  vi.unstubAllGlobals();
+});
+
+test('stats view shows retention, workload, and calendar', async () => {
+  const today = new Date();
+  const pad = (n: number) => String(n).padStart(2, '0');
+  const todayIso = `${today.getFullYear()}-${pad(today.getMonth() + 1)}-${pad(today.getDate())}`;
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (url: any) => {
+      const u = String(url);
+      const body = (v: any) => ({ ok: true, json: () => Promise.resolve(v) });
+      if (u === '/api/config') return body({ googleClientId: null });
+      if (u === '/api/me') return body({ email: 't@example.com' });
+      if (u === '/api/decks')
+        return body({
+          decks: [{ id: 'd1', name: 'Test', total: 10, due: 3, due_today: 5, new: 2 }],
+        });
+      if (u.startsWith('/api/next')) return body({ cards: [] });
+      if (u === '/api/stats')
+        return body({
+          totals: { cards: 10, new: 3, learning: 1, review: 5, suspended: 1, due: 2 },
+          today: { studied: 4, new: 1, reviews: 5, accuracy: 80.0 },
+          forecast: [{ date: todayIso, due: 2 }],
+          review_history: [{ date: todayIso, reviews: 3 }],
+          retention: [
+            { bucket: 'learning', reviews: 1, correct: 1, rate: 100.0 },
+            { bucket: 'young', reviews: 2, correct: 1, rate: 50.0 },
+            { bucket: 'mature', reviews: 0, correct: 0, rate: null },
+          ],
+          workload: [{ date: todayIso, due: 2, new: 20 }],
+        });
+      if (u === '/api/preferences') return body({ daily_goal: 20, reminder_enabled: false });
+      if (u === '/api/fsrs')
+        return body({
+          custom: false, parameters: [], default_parameters: [],
+          review_count: 0, reviews_used: 0,
+          log_loss_before: null, log_loss_after: null, updated_at: null,
+        });
+      if (u === '/api/build-info')
+        return body({ server_started_at: '2026-11-12T14:05:00+00:00', server_git_sha: null });
+      throw new Error(`unexpected fetch ${u}`);
+    }),
+  );
+  render(<App />);
+  await waitFor(() => expect(screen.getByLabelText('menu')).toBeTruthy());
+  fireEvent.click(screen.getByLabelText('menu'));
+  fireEvent.click(screen.getByText('Stats'));
+  await waitFor(() => expect(screen.getByTestId('retention-table')).toBeTruthy());
+  expect(screen.getByTestId('retention-table')).toHaveTextContent('young');
+  expect(screen.getByTestId('retention-table')).toHaveTextContent('50%');
+  expect(screen.getByTestId('workload-table')).toHaveTextContent('Total');
+  await waitFor(() => expect(screen.getByTestId('stats-calendar')).toBeTruthy());
+  expect(screen.getByTestId('stats-calendar')).toHaveTextContent(
+    today.toLocaleString('default', { month: 'long' }),
+  );
+  fireEvent.click(screen.getByRole('button', { name: 'Next month' }));
+  await waitFor(() => expect(screen.getByRole('button', { name: 'Today' })).toBeTruthy());
+  vi.unstubAllGlobals();
+});
+
+test('browse deck settings save budget and order', async () => {
+  let order = 'position';
+  let limit: number | null = null;
+  const puts: any[] = [];
+  const fetchMock = vi.fn(async (url: any, init?: any) => {
+    const u = String(url);
+    const body = (v: any) => ({ ok: true, json: () => Promise.resolve(v) });
+    if (u === '/api/config') return body({ googleClientId: null });
+    if (u === '/api/me') return body({ email: 't@example.com' });
+    if (u === '/api/decks' && (!init?.method || init.method === 'GET'))
+      return body({
+        decks: [
+          {
+            id: 'd1', name: 'Test', total: 2, due: 0, due_today: 0, new: 2,
+            new_cards_per_day: limit, new_order: order, new_limit: limit ?? 20,
+          },
+        ],
+      });
+    if (u === '/api/decks/d1' && init?.method === 'PUT') {
+      const payload = JSON.parse(init.body);
+      puts.push(payload);
+      if (payload.new_cards_per_day != null && payload.new_cards_per_day !== 0)
+        limit = payload.new_cards_per_day;
+      if (payload.new_order) order = payload.new_order;
+      return body({ id: 'd1', name: 'Test', new_cards_per_day: limit, new_order: order, new_limit: limit ?? 20 });
+    }
+    if (u.startsWith('/api/next')) return body({ cards: [] });
+    if (u.startsWith('/api/decks/d1/cards'))
+      return body({ cards: [], total: 0 });
+    if (u.startsWith('/api/decks/d1/duplicates')) return body({ duplicates: [] });
+    throw new Error(`unexpected fetch ${u} ${init?.method ?? 'GET'}`);
+  });
+  vi.stubGlobal('fetch', fetchMock);
+  render(<App />);
+  await waitFor(() => expect(screen.getByLabelText('menu')).toBeTruthy());
+  fireEvent.click(screen.getByLabelText('menu'));
+  fireEvent.click(screen.getAllByText('Browse')[0]);
+  await waitFor(() => expect(screen.getByLabelText(/New cards\/day/)).toBeTruthy());
+  fireEvent.change(screen.getByLabelText(/New cards\/day/), { target: { value: '5' } });
+  fireEvent.mouseDown(screen.getByLabelText('New-card order'));
+  await waitFor(() => expect(screen.getByRole('option', { name: 'Newest first' })).toBeTruthy());
+  fireEvent.click(screen.getByRole('option', { name: 'Newest first' }));
+  fireEvent.click(screen.getByRole('button', { name: 'Save deck settings' }));
+  await waitFor(() =>
+    expect(
+      puts.some((p) => p.new_cards_per_day === 5 && p.new_order === 'newest'),
+    ).toBe(true),
+  );
+  vi.unstubAllGlobals();
+});
+
+test('scheduler steps save to the server', async () => {
+  const puts: any[] = [];
+  const fetchMock = vi.fn(async (url: any, init?: any) => {
+    const u = String(url);
+    const body = (v: any) => ({ ok: true, json: () => Promise.resolve(v) });
+    if (u === '/api/config') return body({ googleClientId: null });
+    if (u === '/api/me') return body({ email: 't@example.com' });
+    if (u === '/api/decks')
+      return body({
+        decks: [{ id: 'd1', name: 'Test', total: 10, due: 3, due_today: 5, new: 2 }],
+      });
+    if (u.startsWith('/api/next')) return body({ cards: [] });
+    if (u === '/api/stats')
+      return body({
+        totals: { cards: 10, new: 3, learning: 1, review: 5, suspended: 1, due: 2 },
+        today: { studied: 4, new: 1, reviews: 5, accuracy: 80.0 },
+        forecast: [{ date: '2026-11-08', due: 2 }],
+      });
+    if (u === '/api/preferences') return body({ daily_goal: 20, reminder_enabled: false });
+    if (u === '/api/fsrs')
+      return body({
+        custom: false, parameters: [], default_parameters: [],
+        review_count: 0, reviews_used: 0,
+        log_loss_before: null, log_loss_after: null, updated_at: null,
+        learning_steps: [1, 10], relearning_steps: [10],
+      });
+    if (u === '/api/fsrs/settings' && init?.method === 'PUT') {
+      puts.push(JSON.parse(init.body));
+      return body({ learning_steps: [15], relearning_steps: [10] });
+    }
+    if (u === '/api/build-info')
+      return body({ server_started_at: '2026-11-12T14:05:00+00:00', server_git_sha: null });
+    throw new Error(`unexpected fetch ${u} ${init?.method ?? 'GET'}`);
+  });
+  vi.stubGlobal('fetch', fetchMock);
+  render(<App />);
+  await waitFor(() => expect(screen.getByLabelText('menu')).toBeTruthy());
+  fireEvent.click(screen.getByLabelText('menu'));
+  fireEvent.click(screen.getByText('Stats'));
+  await waitFor(() => expect(screen.getByLabelText('Learning steps (min)')).toBeTruthy());
+  fireEvent.change(screen.getByLabelText('Learning steps (min)'), {
+    target: { value: '15' },
+  });
+  fireEvent.click(screen.getByRole('button', { name: 'Save steps' }));
+  await waitFor(() =>
+    expect(
+      puts.some((p) => JSON.stringify(p.learning_steps) === '[15]'),
+    ).toBe(true),
+  );
+  vi.unstubAllGlobals();
+});
+
+test('browse tag filter narrows the list by tag', async () => {
+  const fetchMock = vi.fn(async (url: any) => {
+    const u = String(url);
+    const body = (v: any) => ({ ok: true, json: () => Promise.resolve(v) });
+    if (u === '/api/config') return body({ googleClientId: null });
+    if (u === '/api/me') return body({ email: 't@example.com' });
+    if (u === '/api/decks')
+      return body({
+        decks: [{ id: 'd1', name: 'Test', total: 2, due: 0, due_today: 0, new: 2, new_cards_per_day: null, new_order: 'position', new_limit: 20 }],
+      });
+    if (u.startsWith('/api/next')) return body({ cards: [] });
+    if (u.startsWith('/api/decks/d1/cards')) {
+      const tagged = u.includes('tag=biology');
+      const row = (id: string, front: string, tags: string[]) => ({
+        card_id: id, front_text: front, tags, due: '2026-11-08',
+        last_review: null, state: 2, reps: 1, suspended: false, due_today: true,
+      });
+      const cards = tagged
+        ? [row('c1', 'Tagged Q', ['biology'])]
+        : [row('c1', 'Tagged Q', ['biology']), row('c2', 'Plain Q', [])];
+      return body({ cards, total: cards.length });
+    }
+    if (u.startsWith('/api/decks/d1/duplicates')) return body({ duplicates: [] });
+    throw new Error(`unexpected fetch ${u}`);
+  });
+  vi.stubGlobal('fetch', fetchMock);
+  render(<App />);
+  await waitFor(() => expect(screen.getByLabelText('menu')).toBeTruthy());
+  fireEvent.click(screen.getByLabelText('menu'));
+  fireEvent.click(screen.getAllByText('Browse')[0]);
+  await waitFor(() => expect(screen.getByText('Plain Q')).toBeTruthy());
+  fireEvent.change(screen.getByLabelText('Filter by tag'), { target: { value: 'biology' } });
+  await waitFor(() => expect(screen.queryByText('Plain Q')).toBeNull());
+  expect(screen.getByText('Tagged Q')).toBeTruthy();
+  expect(
+    fetchMock.mock.calls.some(([u]) => String(u).includes('tag=biology')),
+  ).toBe(true);
+  vi.unstubAllGlobals();
+});
+
+test('browse detail saves tags and bulk tagging applies to selection', async () => {
+  const patched: any[] = [];
+  let bulked: any = null;
+  const fetchMock = vi.fn(async (url: any, init?: any) => {
+    const u = String(url);
+    const body = (v: any) => ({ ok: true, json: () => Promise.resolve(v) });
+    if (u === '/api/config') return body({ googleClientId: null });
+    if (u === '/api/me') return body({ email: 't@example.com' });
+    if (u === '/api/decks')
+      return body({
+        decks: [{ id: 'd1', name: 'Test', total: 1, due: 0, due_today: 0, new: 1, new_cards_per_day: null, new_order: 'position', new_limit: 20 }],
+      });
+    if (u.startsWith('/api/next')) return body({ cards: [] });
+    if (u.startsWith('/api/decks/d1/cards'))
+      return body({
+        cards: [{
+          card_id: 'c1', card_number: 1, front_text: 'Tagged Q', tags: [],
+          due: '2026-11-08', last_review: null, created_at: null,
+          state: 2, reps: 1, suspended: false, due_today: true,
+        }],
+        total: 1,
+      });
+    if (u === '/api/cards/c1' && (!init?.method || init.method === 'GET'))
+      return body({
+        card_id: 'c1', deck_id: 'd1', front_html: 'Q', back_html: 'A',
+        due: '2026-11-08', state: 2, reps: 1, tags: [],
+      });
+    if (u === '/api/cards/c1/tags' && init?.method === 'PATCH') {
+      patched.push(JSON.parse(init.body));
+      return body({ card_id: 'c1', tags: ['biology'] });
+    }
+    if (u === '/api/cards/bulk-tags' && init?.method === 'POST') {
+      bulked = JSON.parse(init.body);
+      return body({ updated: 1 });
+    }
+    if (u.startsWith('/api/decks/d1/duplicates')) return body({ duplicates: [] });
+    throw new Error(`unexpected fetch ${u} ${init?.method ?? 'GET'}`);
+  });
+  vi.stubGlobal('fetch', fetchMock);
+  render(<App />);
+  await waitFor(() => expect(screen.getByLabelText('menu')).toBeTruthy());
+  fireEvent.click(screen.getByLabelText('menu'));
+  fireEvent.click(screen.getAllByText('Browse')[0]);
+  await waitFor(() => expect(screen.getByText('Tagged Q')).toBeTruthy());
+  fireEvent.click(screen.getByText('Tagged Q'));
+  await waitFor(() => expect(screen.getByTestId('browse-detail')).toBeTruthy());
+  fireEvent.change(screen.getByLabelText('Tags (comma-separated)'), {
+    target: { value: 'Biology' },
+  });
+  fireEvent.click(screen.getByRole('button', { name: 'Save tags' }));
+  await waitFor(() =>
+    expect(patched.some((p) => JSON.stringify(p.tags) === '["Biology"]')).toBe(true),
+  );
+  fireEvent.click(screen.getByRole('button', { name: 'Close' }));
+  await waitFor(() => expect(screen.queryByTestId('browse-detail')).toBeNull());
+  fireEvent.click(screen.getByLabelText('Select card 1'));
+  fireEvent.change(screen.getByLabelText('Add tags'), { target: { value: 'x, y' } });
+  fireEvent.click(screen.getByRole('button', { name: 'Add' }));
+  await waitFor(() => expect(bulked).not.toBeNull());
+  expect(bulked).toMatchObject({ card_ids: ['c1'], add: ['x', 'y'], remove: [] });
+  vi.unstubAllGlobals();
+});
+
+test('review header counts new cards and names the next due time', async () => {
+  const future = new Date(Date.now() + 5 * 60000).toISOString();
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (url: any) => {
+      const u = String(url);
+      const body = (v: any) => ({ ok: true, json: () => Promise.resolve(v) });
+      if (u === '/api/config') return body({ googleClientId: null });
+      if (u === '/api/me') return body({ email: 't@example.com' });
+      if (u === '/api/decks')
+        return body({
+          decks: [
+            { id: 'd1', name: 'Test', total: 2, due: 0, due_today: 0, new: 2, new_cards_per_day: null, new_order: 'position', new_limit: 20, new_due: 2 },
+          ],
+        });
+      if (u.startsWith('/api/next'))
+        return body({ cards: [], next_due_at: future });
+      if (u === '/api/stats')
+        return body({
+          totals: { cards: 2, new: 2, learning: 0, review: 0, suspended: 0, due: 0 },
+          today: { studied: 0, new: 0, reviews: 0, accuracy: null },
+        });
+      throw new Error(`unexpected fetch ${u}`);
+    }),
+  );
+  render(<App />);
+  await waitFor(() => expect(screen.getByText(/0 due today/)).toBeTruthy());
+  expect(screen.getByText(/2 new today/)).toBeTruthy();
+  await waitFor(() => expect(screen.getByText(/next card in/)).toBeTruthy());
+  vi.unstubAllGlobals();
+});
+
+test('add view dictates into question and answer separately', async () => {
+  class FakeRecognition {
+    static instances: any[] = [];
+    lang = '';
+    interimResults = false;
+    continuous = false;
+    onresult: any = null;
+    onend: any = null;
+    onerror: any = null;
+    constructor() {
+      FakeRecognition.instances.push(this);
+    }
+    start() {
+      // Deliver one final transcript, then end.
+      this.onresult?.({
+        resultIndex: 0,
+        results: [{ isFinal: true, 0: { transcript: 'dictated words' } }],
+      });
+      this.onend?.();
+    }
+    stop() {}
+  }
+  vi.stubGlobal('SpeechRecognition', FakeRecognition);
+  const fetchMock = vi.fn(async (url: any) => {
+    const u = String(url);
+    const body = (v: any) => ({ ok: true, json: () => Promise.resolve(v) });
+    if (u === '/api/config') return body({ googleClientId: null });
+    if (u === '/api/me') return body({ email: 't@example.com' });
+    if (u === '/api/decks')
+      return body({
+        decks: [{ id: 'd1', name: 'Test', total: 0, due: 0, due_today: 0, new: 0, new_cards_per_day: null, new_order: 'position', new_limit: 20, new_due: 0 }],
+      });
+    if (u.startsWith('/api/next')) return body({ cards: [], next_due_at: null });
+    if (u.startsWith('/api/decks/d1/duplicates')) return body({ duplicates: [] });
+    throw new Error(`unexpected fetch ${u}`);
+  });
+  vi.stubGlobal('fetch', fetchMock);
+  try {
+    render(<App />);
+    await waitFor(() => expect(screen.getByLabelText('menu')).toBeTruthy());
+    fireEvent.click(screen.getByLabelText('menu'));
+    fireEvent.click(screen.getAllByText('Add new card')[0]);
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Dictate question' })).toBeTruthy());
+    fireEvent.click(screen.getByRole('button', { name: 'Dictate question' }));
+    await waitFor(() =>
+      expect(screen.getByLabelText('Question')).toHaveValue('dictated words'),
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'Dictate answer' }));
+    await waitFor(() =>
+      expect(screen.getByLabelText('Answer')).toHaveValue('dictated words'),
+    );
+  } finally {
+    vi.unstubAllGlobals();
+  }
 });
